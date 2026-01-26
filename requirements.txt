@@ -1,0 +1,10 @@
+# SoupyNBody Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+moderngl>=5.7.0
+moderngl-window>=2.4.0
+
+# Optional: For image export
+# pillow>=9.0.0
