@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Desktop OpenGL N-body galaxy simulator using ModernGL."""
+"""Desktop OpenGL N-body galaxy simulator using REBOUND physics and ModernGL rendering.
+
+This application uses:
+- REBOUND: Professional astrophysical N-body library for accurate physics
+- ModernGL: Modern OpenGL bindings for Python for GPU-accelerated rendering
+
+REBOUND provides multiple high-accuracy integrators:
+- IAS15: 15th order adaptive integrator (default, most accurate)
+- WHFast: Fast symplectic integrator for planetary systems
+- MERCURIUS: Hybrid integrator for close encounters
+"""
 
 import sys
 import os
@@ -12,9 +22,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 import moderngl
 import moderngl_window as mglw
-from moderngl_window import geometry
 
-from core.physics import NBodySimulation
+from core.physics import REBOUNDSimulation, GalaxyConfig, Integrator, REBOUND_AVAILABLE
 from core.render import Camera, ColorMap
 from core.shared import Config
 
@@ -27,10 +36,10 @@ def load_shader(filename: str) -> str:
 
 
 class NBodyWindow(mglw.WindowConfig):
-    """Main application window for the N-body simulation."""
+    """Main application window for the REBOUND-powered N-body simulation."""
 
-    title = "SoupyNBody - Galaxy Simulator"
-    gl_version = (4, 3)
+    title = "SoupyNBody - Galaxy Simulator (REBOUND Physics)"
+    gl_version = (3, 3)  # Reduced requirement since we don't need compute shaders
     window_size = (1280, 720)
     aspect_ratio = None
     resizable = True
@@ -39,38 +48,47 @@ class NBodyWindow(mglw.WindowConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # Check REBOUND availability
+        if not REBOUND_AVAILABLE:
+            print("ERROR: REBOUND library not installed.")
+            print("Install with: pip install rebound")
+            sys.exit(1)
+
         # Load configuration
         self.config = Config.from_env()
-        self.use_gpu = self.config.physics_mode.lower() == 'gpu'
 
-        print(f"Initializing SoupyNBody with {self.config.num_particles} particles")
-        print(f"Physics mode: {'GPU compute shaders' if self.use_gpu else 'CPU fallback'}")
+        # Get integrator from environment
+        integrator_name = os.environ.get('INTEGRATOR', 'ias15').upper()
+        try:
+            integrator = Integrator[integrator_name]
+        except KeyError:
+            print(f"Unknown integrator '{integrator_name}', using IAS15")
+            integrator = Integrator.IAS15
 
-        # Initialize simulation
-        self.simulation = NBodySimulation(
+        # Galaxy configuration
+        galaxy_config = GalaxyConfig(
             num_particles=self.config.num_particles,
-            G=self.config.gravitational_constant,
-            softening=self.config.softening,
-            timestep=self.config.timestep
-        )
-        self.simulation.initialize_galaxy(
-            radius=self.config.galaxy_radius,
-            thickness=self.config.galaxy_thickness,
-            central_mass=self.config.central_mass
+            central_mass=1e6,
+            disk_mass=1e4,
+            disk_radius=self.config.galaxy_radius,
+            disk_scale_height=self.config.galaxy_thickness,
+            bulge_fraction=0.1,
         )
 
-        # Try to set up GPU compute if requested
-        if self.use_gpu:
-            try:
-                compute_source = load_shader("nbody_compute.glsl")
-                self.simulation.setup_gpu(self.ctx, compute_source)
-                if not self.simulation.is_gpu_ready:
-                    print("GPU compute not available, using CPU mode")
-                    self.use_gpu = False
-            except Exception as e:
-                print(f"Could not initialize GPU compute: {e}")
-                print("Falling back to CPU mode")
-                self.use_gpu = False
+        print(f"Initializing SoupyNBody with REBOUND physics")
+        print(f"  Particles: {galaxy_config.num_particles}")
+        print(f"  Integrator: {integrator.value}")
+        print(f"  Central mass: {galaxy_config.central_mass:.2e}")
+
+        # Initialize simulation with REBOUND
+        self.simulation = REBOUNDSimulation(
+            config=galaxy_config,
+            integrator=integrator
+        )
+        self.simulation.initialize_galaxy(seed=42)
+
+        # Store galaxy radius for rendering
+        self.galaxy_radius = galaxy_config.disk_radius
 
         # Initialize camera
         self.camera = Camera(
@@ -90,11 +108,16 @@ class NBodyWindow(mglw.WindowConfig):
         self.paused = False
         self.auto_rotate = True
         self.mouse_dragging = False
-        self.last_mouse_pos = (0, 0)
+        self.show_info = True
+        self.frame_count = 0
+        self.total_time = 0.0
 
         print("\nControls:")
         print("  Space     - Pause/Resume simulation")
         print("  R         - Toggle auto-rotation")
+        print("  I         - Toggle info display")
+        print("  E         - Export current state for UE5")
+        print("  C         - Initialize galaxy collision")
         print("  Mouse     - Drag to orbit camera")
         print("  Scroll    - Zoom in/out")
         print("  Escape    - Exit")
@@ -114,12 +137,12 @@ class NBodyWindow(mglw.WindowConfig):
         # Generate initial colors based on particle positions
         colors = self.colormap.colors_from_radii(
             self.simulation.positions,
-            max_radius=self.config.galaxy_radius
+            max_radius=self.galaxy_radius
         )
 
         # Create vertex buffer with positions and colors
-        # Interleave position (3 floats) and color (3 floats)
-        vertex_data = np.zeros((self.config.num_particles, 6), dtype=np.float32)
+        num_particles = self.simulation.num_particles
+        vertex_data = np.zeros((num_particles, 6), dtype=np.float32)
         vertex_data[:, :3] = self.simulation.positions
         vertex_data[:, 3:] = colors
 
@@ -131,7 +154,7 @@ class NBodyWindow(mglw.WindowConfig):
 
         # Set uniforms
         self.program['point_size'].value = self.config.point_size
-        self.program['max_radius'].value = self.config.galaxy_radius
+        self.program['max_radius'].value = self.galaxy_radius
 
         # Enable point sprites and blending
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
@@ -142,10 +165,11 @@ class NBodyWindow(mglw.WindowConfig):
         """Update vertex buffer with new particle positions."""
         colors = self.colormap.colors_from_radii(
             self.simulation.positions,
-            max_radius=self.config.galaxy_radius
+            max_radius=self.galaxy_radius
         )
 
-        vertex_data = np.zeros((self.config.num_particles, 6), dtype=np.float32)
+        num_particles = self.simulation.num_particles
+        vertex_data = np.zeros((num_particles, 6), dtype=np.float32)
         vertex_data[:, :3] = self.simulation.positions
         vertex_data[:, 3:] = colors
 
@@ -156,12 +180,14 @@ class NBodyWindow(mglw.WindowConfig):
         # Clear screen
         self.ctx.clear(*self.config.background_color)
 
-        # Update simulation (multiple steps per frame for smoother animation)
-        if not self.paused:
-            steps_per_frame = 2
-            for _ in range(steps_per_frame):
-                self.simulation.step(use_gpu=self.use_gpu)
+        # Update simulation
+        if not self.paused and frame_time > 0:
+            # Use adaptive timestep based on frame time
+            # But clamp to reasonable range for stability
+            dt = min(frame_time * 0.5, 0.05)
+            self.simulation.step(dt)
             self._update_vertex_buffer()
+            self.total_time = self.simulation.time
 
         # Update camera
         self.camera.update(frame_time, auto_rotate=self.auto_rotate and not self.paused)
@@ -173,6 +199,8 @@ class NBodyWindow(mglw.WindowConfig):
         # Draw particles
         self.vao.render(moderngl.POINTS)
 
+        self.frame_count += 1
+
     def resize(self, width: int, height: int):
         """Handle window resize."""
         self.camera.set_aspect(width, height)
@@ -183,17 +211,87 @@ class NBodyWindow(mglw.WindowConfig):
             if key == self.wnd.keys.SPACE:
                 self.paused = not self.paused
                 print(f"Simulation {'paused' if self.paused else 'resumed'}")
+
             elif key == self.wnd.keys.R:
                 self.auto_rotate = not self.auto_rotate
                 print(f"Auto-rotation {'enabled' if self.auto_rotate else 'disabled'}")
+
+            elif key == self.wnd.keys.I:
+                self.show_info = not self.show_info
+
+            elif key == self.wnd.keys.E:
+                self._export_for_ue5()
+
+            elif key == self.wnd.keys.C:
+                self._initialize_collision()
+
             elif key == self.wnd.keys.ESCAPE:
                 self.wnd.close()
+
+    def _export_for_ue5(self):
+        """Export simulation data for UE5 Niagara."""
+        try:
+            from core.export import UE5Exporter, ExportFormat
+
+            print("\nExporting simulation for UE5...")
+            exporter = UE5Exporter(self.simulation)
+
+            # Record 10 seconds of simulation at 30 FPS
+            def progress(frame, total):
+                if frame % 50 == 0:
+                    print(f"  Recording: {frame}/{total} frames")
+
+            exporter.simulate_and_record(duration=10.0, fps=30, progress_callback=progress)
+
+            # Export to binary format
+            output_path = PROJECT_ROOT / "exports" / "galaxy_simulation.bin"
+            output_path.parent.mkdir(exist_ok=True)
+            exporter.export_binary(str(output_path))
+
+            # Also export Niagara NDI format
+            ndi_path = PROJECT_ROOT / "exports" / "niagara_ndi"
+            exporter.export_niagara_ndi(str(ndi_path))
+
+            print(f"\nExport complete! Files saved to: {PROJECT_ROOT / 'exports'}")
+
+        except Exception as e:
+            print(f"Export failed: {e}")
+
+    def _initialize_collision(self):
+        """Reinitialize with two colliding galaxies."""
+        print("\nInitializing galaxy collision...")
+
+        galaxy1 = GalaxyConfig(num_particles=2500, central_mass=5e5)
+        galaxy2 = GalaxyConfig(num_particles=2500, central_mass=5e5)
+
+        self.simulation.initialize_collision(
+            galaxy1_config=galaxy1,
+            galaxy2_config=galaxy2,
+            separation=40.0,
+            relative_velocity=0.3,
+            impact_parameter=10.0
+        )
+
+        # Update galaxy radius for color mapping
+        self.galaxy_radius = 30.0
+        self.program['max_radius'].value = self.galaxy_radius
+
+        # Reallocate buffers if particle count changed
+        num_particles = self.simulation.num_particles
+        vertex_data = np.zeros((num_particles, 6), dtype=np.float32)
+        self.vbo = self.ctx.buffer(vertex_data.tobytes())
+        self.vao = self.ctx.vertex_array(
+            self.program,
+            [(self.vbo, '3f 3f', 'in_position', 'in_color')],
+        )
+
+        self._update_vertex_buffer()
+        print(f"Collision initialized with {num_particles} total particles")
 
     def mouse_press_event(self, x: int, y: int, button: int):
         """Handle mouse press."""
         if button == 1:  # Left button
             self.mouse_dragging = True
-            self.last_mouse_pos = (x, y)
 
     def mouse_release_event(self, x: int, y: int, button: int):
         """Handle mouse release."""
@@ -213,6 +311,12 @@ class NBodyWindow(mglw.WindowConfig):
 
 def main():
     """Entry point for the desktop GL application."""
+    print("=" * 60)
+    print("SoupyNBody - N-Body Galaxy Simulator")
+    print("Powered by REBOUND (astrophysical N-body library)")
+    print("=" * 60)
+    print()
+
     mglw.run_window_config(NBodyWindow)
 
 

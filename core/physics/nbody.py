@@ -1,177 +1,397 @@
-"""N-body simulation core module."""
+"""N-body simulation using REBOUND astrophysical library.
+
+REBOUND is a professional N-body library used in astrophysics research.
+It provides multiple high-accuracy integrators and proper gravitational dynamics.
+"""
 
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from enum import Enum
 
-from .integrator import LeapfrogIntegrator
+try:
+    import rebound
+    REBOUND_AVAILABLE = True
+except ImportError:
+    REBOUND_AVAILABLE = False
+    print("Warning: REBOUND not installed. Install with: pip install rebound")
 
 
-class NBodySimulation:
-    """N-body gravitational simulation.
+class Integrator(Enum):
+    """Available REBOUND integrators."""
+    IAS15 = "ias15"          # High accuracy, adaptive timestep (default)
+    WHFAST = "whfast"        # Fast symplectic, good for planetary systems
+    LEAPFROG = "leapfrog"    # Simple symplectic
+    SEI = "sei"              # Symplectic epicycle integrator
+    MERCURIUS = "mercurius"  # Hybrid symplectic + IAS15 for close encounters
 
-    Supports both GPU compute shader mode and CPU fallback mode.
+
+@dataclass
+class GalaxyConfig:
+    """Configuration for galaxy initialization."""
+    num_particles: int = 5000
+    central_mass: float = 1e6        # Solar masses
+    disk_mass: float = 1e4           # Total disk mass in solar masses
+    disk_radius: float = 15.0        # kpc
+    disk_scale_height: float = 0.3   # kpc
+    bulge_fraction: float = 0.1      # Fraction of particles in bulge
+    halo_fraction: float = 0.0       # Fraction in dark matter halo (simplified)
+
+
+class REBOUNDSimulation:
+    """N-body simulation powered by REBOUND.
+
+    Uses REBOUND's high-accuracy integrators for proper gravitational dynamics.
+    Supports various galaxy configurations and integrator choices.
     """
 
-    def __init__(self, num_particles: int, G: float = 1.0, softening: float = 0.1,
-                 timestep: float = 0.001):
-        """Initialize the N-body simulation.
+    def __init__(self, config: Optional[GalaxyConfig] = None,
+                 integrator: Integrator = Integrator.IAS15):
+        """Initialize the REBOUND-based simulation.
 
         Args:
-            num_particles: Number of particles in the simulation
-            G: Gravitational constant
-            softening: Softening parameter to prevent singularities
-            timestep: Integration time step
+            config: Galaxy configuration parameters
+            integrator: Which REBOUND integrator to use
         """
-        self.num_particles = num_particles
-        self.G = G
-        self.softening = softening
-        self.timestep = timestep
+        if not REBOUND_AVAILABLE:
+            raise ImportError("REBOUND is required. Install with: pip install rebound")
 
-        # Particle data arrays
-        self.positions: np.ndarray = np.zeros((num_particles, 3), dtype=np.float32)
-        self.velocities: np.ndarray = np.zeros((num_particles, 3), dtype=np.float32)
-        self.masses: np.ndarray = np.ones(num_particles, dtype=np.float32)
+        self.config = config or GalaxyConfig()
+        self._integrator_type = integrator
 
-        # CPU integrator for fallback mode
-        self._integrator = LeapfrogIntegrator()
+        # Create REBOUND simulation
+        self.sim = rebound.Simulation()
+        self.sim.integrator = integrator.value
 
-        # GPU resources (set up later if available)
-        self._gpu_initialized = False
-        self._ctx = None
-        self._compute_shader = None
-        self._position_buffer = None
-        self._velocity_buffer = None
-        self._mass_buffer = None
+        # Set units (use G=1 normalized units for simplicity)
+        self.sim.G = 1.0
 
-    def initialize_galaxy(self, radius: float = 10.0, thickness: float = 0.5,
-                          central_mass: float = 1000.0):
-        """Initialize particles in a disk galaxy configuration.
+        # Configure integrator-specific settings
+        self._configure_integrator()
+
+        # Cached numpy arrays for rendering (updated after each step)
+        self._positions: Optional[np.ndarray] = None
+        self._velocities: Optional[np.ndarray] = None
+        self._masses: Optional[np.ndarray] = None
+
+        # Simulation state
+        self.time = 0.0
+        self.timestep = 0.01
+
+    def _configure_integrator(self):
+        """Configure integrator-specific settings."""
+        if self._integrator_type == Integrator.IAS15:
+            # IAS15 is adaptive, no fixed timestep needed
+            pass
+        elif self._integrator_type == Integrator.WHFAST:
+            # WHFast needs a fixed timestep, set based on fastest orbit
+            self.sim.dt = 0.01
+        elif self._integrator_type == Integrator.MERCURIUS:
+            # Mercurius: hybrid integrator
+            self.sim.ri_mercurius.hillfac = 3.0
+
+    def initialize_galaxy(self, seed: Optional[int] = None):
+        """Initialize particles in a realistic galaxy configuration.
+
+        Creates a disk galaxy with:
+        - Central supermassive black hole / bulge
+        - Exponential disk with proper rotation curve
+        - Optional bulge and halo components
 
         Args:
-            radius: Radius of the galaxy disk
-            thickness: Vertical thickness of the disk
-            central_mass: Mass of the central black hole/bulge
+            seed: Random seed for reproducibility
         """
-        n = self.num_particles
+        if seed is not None:
+            np.random.seed(seed)
 
-        # Generate radial positions with exponential distribution (disk profile)
-        r = radius * np.sqrt(np.random.random(n))
+        cfg = self.config
+        n = cfg.num_particles
 
-        # Angular positions uniformly distributed
-        theta = 2.0 * np.pi * np.random.random(n)
+        # Clear existing particles
+        while self.sim.N > 0:
+            self.sim.remove(0)
 
-        # Convert to Cartesian coordinates
-        self.positions[:, 0] = r * np.cos(theta)
-        self.positions[:, 1] = r * np.sin(theta)
-        self.positions[:, 2] = thickness * (np.random.random(n) - 0.5)
+        # 1. Add central mass (SMBH / bulge core)
+        self.sim.add(m=cfg.central_mass, x=0, y=0, z=0, vx=0, vy=0, vz=0)
 
-        # Calculate circular orbital velocity for each particle
-        # v = sqrt(G * M_enclosed / r)
-        # Assuming central mass dominates
-        v_circular = np.sqrt(self.G * central_mass / (r + self.softening))
+        # 2. Calculate particle distribution
+        n_bulge = int(n * cfg.bulge_fraction)
+        n_disk = n - n_bulge - 1  # -1 for central mass
 
-        # Set velocities tangent to orbit (perpendicular to radial direction)
-        self.velocities[:, 0] = -v_circular * np.sin(theta)
-        self.velocities[:, 1] = v_circular * np.cos(theta)
-        self.velocities[:, 2] = 0.0
+        # Individual particle mass
+        particle_mass = cfg.disk_mass / (n_disk + n_bulge)
 
-        # Add small random velocity dispersion
-        dispersion = 0.05 * v_circular[:, np.newaxis]
-        self.velocities += dispersion * np.random.randn(n, 3)
+        # 3. Add disk particles with exponential radial profile
+        for i in range(n_disk):
+            # Exponential disk profile: P(r) ∝ r * exp(-r/R_d)
+            # Use inverse CDF sampling
+            u = np.random.random()
+            # Approximate inverse CDF for exponential disk
+            r = -cfg.disk_radius * 0.3 * np.log(1 - u * (1 - np.exp(-cfg.disk_radius / (cfg.disk_radius * 0.3))))
+            r = np.clip(r, 0.1, cfg.disk_radius)
 
-        # Set masses - smaller particles have unit mass
-        self.masses[:] = 1.0
+            theta = 2.0 * np.pi * np.random.random()
 
-        # First particle is the central mass
-        self.positions[0] = [0.0, 0.0, 0.0]
-        self.velocities[0] = [0.0, 0.0, 0.0]
-        self.masses[0] = central_mass
+            # Positions
+            x = r * np.cos(theta)
+            y = r * np.sin(theta)
+            z = cfg.disk_scale_height * np.random.standard_normal() * np.exp(-r / cfg.disk_radius)
 
-        # Convert to float32 for GPU compatibility
-        self.positions = self.positions.astype(np.float32)
-        self.velocities = self.velocities.astype(np.float32)
-        self.masses = self.masses.astype(np.float32)
+            # Circular velocity from enclosed mass (simplified: central mass dominates)
+            # v_circ = sqrt(G * M_enclosed / r)
+            M_enclosed = cfg.central_mass + particle_mass * i * (r / cfg.disk_radius)
+            v_circ = np.sqrt(self.sim.G * M_enclosed / r)
 
-    def setup_gpu(self, ctx, compute_shader_source: str):
-        """Initialize GPU compute shader resources.
+            # Add velocity dispersion (Toomre Q parameter consideration)
+            sigma_r = 0.1 * v_circ  # Radial velocity dispersion
+            sigma_z = 0.05 * v_circ  # Vertical velocity dispersion
+
+            # Tangential velocity (circular + dispersion)
+            vx = -v_circ * np.sin(theta) + sigma_r * np.random.standard_normal() * np.cos(theta)
+            vy = v_circ * np.cos(theta) + sigma_r * np.random.standard_normal() * np.sin(theta)
+            vz = sigma_z * np.random.standard_normal()
+
+            self.sim.add(m=particle_mass, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz)
+
+        # 4. Add bulge particles (spherical distribution)
+        bulge_radius = cfg.disk_radius * 0.2
+        for i in range(n_bulge):
+            # Hernquist profile for bulge
+            u = np.random.random()
+            r = bulge_radius * np.sqrt(u) / (1 - np.sqrt(u) + 0.01)
+            r = np.clip(r, 0.1, bulge_radius * 3)
+
+            # Spherical angles
+            theta = 2.0 * np.pi * np.random.random()
+            phi = np.arccos(2.0 * np.random.random() - 1.0)
+
+            x = r * np.sin(phi) * np.cos(theta)
+            y = r * np.sin(phi) * np.sin(theta)
+            z = r * np.cos(phi)
+
+            # Velocity dispersion (isotropic)
+            sigma = np.sqrt(self.sim.G * cfg.central_mass / (r + bulge_radius)) * 0.5
+            vx = sigma * np.random.standard_normal()
+            vy = sigma * np.random.standard_normal()
+            vz = sigma * np.random.standard_normal()
+
+            self.sim.add(m=particle_mass, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz)
+
+        # 5. Move to center of mass frame
+        self.sim.move_to_com()
+
+        # Update cached arrays
+        self._update_arrays()
+
+        print(f"Initialized galaxy with {self.sim.N} particles")
+        print(f"  Central mass: {cfg.central_mass:.2e}")
+        print(f"  Disk particles: {n_disk}")
+        print(f"  Bulge particles: {n_bulge}")
+        print(f"  Integrator: {self._integrator_type.value}")
+
+    def initialize_collision(self, galaxy1_config: Optional[GalaxyConfig] = None,
+                            galaxy2_config: Optional[GalaxyConfig] = None,
+                            separation: float = 30.0,
+                            relative_velocity: float = 0.5,
+                            impact_parameter: float = 5.0):
+        """Initialize two galaxies on collision course.
 
         Args:
-            ctx: ModernGL context
-            compute_shader_source: GLSL compute shader source code
+            galaxy1_config: Config for first galaxy
+            galaxy2_config: Config for second galaxy (defaults to galaxy1)
+            separation: Initial separation between galaxy centers
+            relative_velocity: Approach velocity
+            impact_parameter: Perpendicular offset (0 = head-on)
         """
-        self._ctx = ctx
+        cfg1 = galaxy1_config or GalaxyConfig(num_particles=2500)
+        cfg2 = galaxy2_config or GalaxyConfig(num_particles=2500)
 
-        try:
-            self._compute_shader = ctx.compute_shader(compute_shader_source)
+        # Create first galaxy at origin
+        self.config = cfg1
+        self.initialize_galaxy(seed=42)
 
-            # Create GPU buffers
-            self._position_buffer = ctx.buffer(self.positions.tobytes())
-            self._velocity_buffer = ctx.buffer(self.velocities.tobytes())
-            self._mass_buffer = ctx.buffer(self.masses.tobytes())
+        # Store first galaxy particles
+        particles1 = [(p.m, p.x, p.y, p.z, p.vx, p.vy, p.vz)
+                      for p in self.sim.particles]
 
-            self._gpu_initialized = True
-        except Exception as e:
-            print(f"GPU compute shader initialization failed: {e}")
-            print("Falling back to CPU simulation mode.")
-            self._gpu_initialized = False
+        # Clear and create second galaxy
+        while self.sim.N > 0:
+            self.sim.remove(0)
 
-    def step_cpu(self):
-        """Perform one simulation step on CPU."""
-        self.positions, self.velocities = self._integrator.step(
-            self.positions, self.velocities, self.masses,
-            self.timestep, self.G, self.softening
-        )
+        self.config = cfg2
+        self.initialize_galaxy(seed=123)
 
-    def step_gpu(self):
-        """Perform one simulation step on GPU using compute shader."""
-        if not self._gpu_initialized:
-            self.step_cpu()
-            return
+        # Offset second galaxy
+        for p in self.sim.particles:
+            p.x += separation
+            p.y += impact_parameter
+            p.vx -= relative_velocity
 
-        # Update uniforms
-        self._compute_shader['dt'].value = self.timestep
-        self._compute_shader['G'].value = self.G
-        self._compute_shader['softening'].value = self.softening
-        self._compute_shader['num_particles'].value = self.num_particles
+        particles2 = [(p.m, p.x, p.y, p.z, p.vx, p.vy, p.vz)
+                      for p in self.sim.particles]
 
-        # Bind buffers
-        self._position_buffer.bind_to_storage_buffer(0)
-        self._velocity_buffer.bind_to_storage_buffer(1)
-        self._mass_buffer.bind_to_storage_buffer(2)
+        # Clear and add all particles
+        while self.sim.N > 0:
+            self.sim.remove(0)
 
-        # Run compute shader
-        work_groups = (self.num_particles + 255) // 256
-        self._compute_shader.run(work_groups, 1, 1)
+        for m, x, y, z, vx, vy, vz in particles1 + particles2:
+            self.sim.add(m=m, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz)
 
-        # Synchronize and read back positions for rendering
-        self._ctx.finish()
-        self.positions = np.frombuffer(
-            self._position_buffer.read(), dtype=np.float32
-        ).reshape(-1, 3).copy()
+        self.sim.move_to_com()
+        self._update_arrays()
 
-    def step(self, use_gpu: bool = True):
-        """Perform one simulation step.
+        print(f"Initialized galaxy collision with {self.sim.N} total particles")
+
+    def _update_arrays(self):
+        """Update cached numpy arrays from REBOUND particles."""
+        n = self.sim.N
+        self._positions = np.zeros((n, 3), dtype=np.float32)
+        self._velocities = np.zeros((n, 3), dtype=np.float32)
+        self._masses = np.zeros(n, dtype=np.float32)
+
+        for i, p in enumerate(self.sim.particles):
+            self._positions[i] = [p.x, p.y, p.z]
+            self._velocities[i] = [p.vx, p.vy, p.vz]
+            self._masses[i] = p.m
+
+    def step(self, dt: Optional[float] = None):
+        """Advance simulation by one timestep.
 
         Args:
-            use_gpu: Whether to use GPU compute shaders if available
+            dt: Timestep (uses default if not specified)
         """
-        if use_gpu and self._gpu_initialized:
-            self.step_gpu()
-        else:
-            self.step_cpu()
+        dt = dt or self.timestep
+        self.sim.integrate(self.sim.t + dt)
+        self.time = self.sim.t
+        self._update_arrays()
 
-    def sync_to_gpu(self):
-        """Upload current particle data to GPU buffers."""
-        if self._gpu_initialized:
-            self._position_buffer.write(self.positions.tobytes())
-            self._velocity_buffer.write(self.velocities.tobytes())
-            self._mass_buffer.write(self.masses.tobytes())
+    def step_to(self, target_time: float):
+        """Integrate to a specific time.
 
-    def get_position_buffer(self):
-        """Get the GPU position buffer for rendering."""
-        return self._position_buffer
+        Args:
+            target_time: Target simulation time
+        """
+        self.sim.integrate(target_time)
+        self.time = self.sim.t
+        self._update_arrays()
 
     @property
-    def is_gpu_ready(self) -> bool:
-        """Check if GPU compute is initialized."""
-        return self._gpu_initialized
+    def positions(self) -> np.ndarray:
+        """Get particle positions as numpy array (N, 3)."""
+        if self._positions is None:
+            self._update_arrays()
+        return self._positions
+
+    @property
+    def velocities(self) -> np.ndarray:
+        """Get particle velocities as numpy array (N, 3)."""
+        if self._velocities is None:
+            self._update_arrays()
+        return self._velocities
+
+    @property
+    def masses(self) -> np.ndarray:
+        """Get particle masses as numpy array (N,)."""
+        if self._masses is None:
+            self._update_arrays()
+        return self._masses
+
+    @property
+    def num_particles(self) -> int:
+        """Get number of particles."""
+        return self.sim.N
+
+    def get_energy(self) -> Tuple[float, float, float]:
+        """Get system energy.
+
+        Returns:
+            Tuple of (kinetic_energy, potential_energy, total_energy)
+        """
+        ke = self.sim.calculate_energy() - self.sim.calculate_energy()  # Placeholder
+        pe = 0.0
+
+        # Calculate energies manually for accuracy
+        for i, p in enumerate(self.sim.particles):
+            ke += 0.5 * p.m * (p.vx**2 + p.vy**2 + p.vz**2)
+            for j in range(i + 1, self.sim.N):
+                q = self.sim.particles[j]
+                dx = p.x - q.x
+                dy = p.y - q.y
+                dz = p.z - q.z
+                r = np.sqrt(dx**2 + dy**2 + dz**2)
+                if r > 0:
+                    pe -= self.sim.G * p.m * q.m / r
+
+        return ke, pe, ke + pe
+
+    def save_snapshot(self, filename: str):
+        """Save simulation state to file.
+
+        Args:
+            filename: Output filename (.bin for binary, .txt for ASCII)
+        """
+        self.sim.save_to_file(filename)
+        print(f"Saved snapshot to {filename}")
+
+    def load_snapshot(self, filename: str):
+        """Load simulation state from file.
+
+        Args:
+            filename: Input filename
+        """
+        self.sim = rebound.Simulation(filename)
+        self._update_arrays()
+        print(f"Loaded snapshot from {filename}")
+
+    def export_for_ue5(self, filename: str, duration: float, fps: int = 30):
+        """Export simulation as frame data for UE5 Niagara.
+
+        Exports particle positions and velocities for each frame as binary data
+        that can be imported into Unreal Engine.
+
+        Args:
+            filename: Output filename (.bin)
+            duration: Duration in simulation time units
+            fps: Frames per second for export
+        """
+        num_frames = int(duration * fps)
+        dt = duration / num_frames
+
+        # Reset to initial state if needed
+        initial_time = self.time
+
+        # Prepare output arrays
+        all_positions = []
+        all_velocities = []
+
+        print(f"Exporting {num_frames} frames for UE5...")
+
+        for frame in range(num_frames):
+            self._update_arrays()
+            all_positions.append(self._positions.copy())
+            all_velocities.append(self._velocities.copy())
+
+            if frame < num_frames - 1:
+                self.step(dt)
+
+            if frame % 100 == 0:
+                print(f"  Frame {frame}/{num_frames}")
+
+        # Save as numpy archive
+        np.savez_compressed(
+            filename,
+            positions=np.array(all_positions),
+            velocities=np.array(all_velocities),
+            masses=self._masses,
+            fps=fps,
+            num_particles=self.num_particles
+        )
+
+        print(f"Exported to {filename}")
+        print(f"  Frames: {num_frames}")
+        print(f"  Particles: {self.num_particles}")
+        print(f"  File size: {np.array(all_positions).nbytes / 1e6:.1f} MB")
+
+
+# Backwards compatibility alias
+NBodySimulation = REBOUNDSimulation
