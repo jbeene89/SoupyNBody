@@ -3,8 +3,13 @@
 
 # Core dependencies
 numpy>=1.21.0
+rebound>=3.26.0          # REBOUND N-body library for accurate physics
+
+# Desktop viewer (OpenGL)
 moderngl>=5.7.0
 moderngl-window>=2.4.0
 
-# Optional: For image export
+# Optional: For image/video export
 # pillow>=9.0.0
+# imageio>=2.9.0
+# imageio-ffmpeg>=0.4.0
