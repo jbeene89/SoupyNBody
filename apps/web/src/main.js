@@ -10,6 +10,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { NBodyEngine, Body } from './physics.js';
 
 // ============================================================================
 // Configuration
@@ -322,6 +323,9 @@ let fpvSavedCamTarget = null;
 let raycaster = null;
 let fpvPointerLocked = false;
 
+// Physics engine (university-level N-body computation)
+let nBodyEngine = null;
+
 function init() {
     // Scene
     scene = new THREE.Scene();
@@ -367,6 +371,19 @@ function init() {
 
     // Background stars
     createBackgroundStars();
+
+    // Initialize N-body physics engine (Yoshida 4th-order symplectic integrator)
+    nBodyEngine = new NBodyEngine({
+        G: CONFIG.G,
+        softening: CONFIG.softening,
+        dt: 0.016,
+        integrator: 'yoshida4',
+        adaptiveStep: true,
+        etaParam: 0.02,
+        restitution: 0.3,
+        enableFragmentation: false, // we handle visual breakup ourselves
+        trackConservation: true,
+    });
 
     // Create planets
     createPlanets();
@@ -500,6 +517,22 @@ function createPlanets() {
             ).normalize(),
         };
         planets.push(planet);
+
+        // Register with N-body engine
+        const body = new Body({
+            mass: pType.mass,
+            radius: pType.radius,
+            x: arrangements[i].pos.x,
+            y: arrangements[i].pos.y,
+            z: arrangements[i].pos.z,
+            vx: arrangements[i].vel.x,
+            vy: arrangements[i].vel.y,
+            vz: arrangements[i].vel.z,
+            id: `planet-${i}`,
+            type: pType.type,
+        });
+        nBodyEngine.addBody(body);
+        planet.bodyRef = body; // link for syncing
 
         // Create moons
         for (let m = 0; m < pType.moons; m++) {
@@ -693,47 +726,65 @@ function updatePhysics(dt) {
     }
 
     const activePlanets = planets.filter(p => p.alive);
-    const intactPlanets = activePlanets.filter(p => !p.breaking);
 
-    // Planet-planet gravity and collision detection (only intact planets collide)
-    for (let i = 0; i < activePlanets.length; i++) {
-        const a = activePlanets[i];
-        for (let j = i + 1; j < activePlanets.length; j++) {
-            const b = activePlanets[j];
+    // --- N-Body Engine Integration (Yoshida 4th-order symplectic) ---
+    // Sync engine G in case user changed the slider
+    nBodyEngine.G = CONFIG.G;
 
-            const dx = b.mesh.position.x - a.mesh.position.x;
-            const dy = b.mesh.position.y - a.mesh.position.y;
-            const dz = b.mesh.position.z - a.mesh.position.z;
-            const dist2 = dx*dx + dy*dy + dz*dz + CONFIG.softening;
-            const dist = Math.sqrt(dist2);
+    // Step the integrator only (no internal collision resolution - we handle visuals ourselves)
+    const intactBodies = activePlanets.filter(p => !p.breaking && p.bodyRef);
+    if (intactBodies.length > 0) {
+        const stepDt = nBodyEngine.adaptiveStep ? nBodyEngine.computeAdaptiveDt() : dt;
+        nBodyEngine.stepYoshida4(stepDt);
+        nBodyEngine.time += stepDt;
+        nBodyEngine.stepCount++;
+        if (nBodyEngine.stepCount % 10 === 0) {
+            nBodyEngine.updateConservationDiagnostics();
+        }
+    }
 
-            // Gravity
-            const F = CONFIG.G * a.mass * b.mass / dist2;
-            const fx = F * dx / dist;
-            const fy = F * dy / dist;
-            const fz = F * dz / dist;
+    // Sync engine state back to Three.js meshes
+    for (const p of activePlanets) {
+        if (!p.bodyRef) continue;
+        const b = p.bodyRef;
 
-            a.vel.x += fx / a.mass * dt;
-            a.vel.y += fy / a.mass * dt;
-            a.vel.z += fz / a.mass * dt;
-            b.vel.x -= fx / b.mass * dt;
-            b.vel.y -= fy / b.mass * dt;
-            b.vel.z -= fz / b.mass * dt;
-
-            // Collision detection (only intact planets)
-            if (!a.breaking && !b.breaking && dist < (a.radius + b.radius) * 0.9) {
-                handleCollision(a, b);
-            }
+        if (!p.breaking) {
+            // Read positions/velocities from engine
+            p.mesh.position.set(b.x, b.y, b.z);
+            p.vel.set(b.vx, b.vy, b.vz);
+        } else {
+            // Breaking planets: push our position back to engine (visual drives physics)
+            b.x = p.mesh.position.x;
+            b.y = p.mesh.position.y;
+            b.z = p.mesh.position.z;
+            b.vx = p.vel.x;
+            b.vy = p.vel.y;
+            b.vz = p.vel.z;
+            // Still move breaking planets
+            p.mesh.position.x += p.vel.x * dt;
+            p.mesh.position.y += p.vel.y * dt;
+            p.mesh.position.z += p.vel.z * dt;
         }
 
-        // Update position
-        a.mesh.position.x += a.vel.x * dt;
-        a.mesh.position.y += a.vel.y * dt;
-        a.mesh.position.z += a.vel.z * dt;
-
         // Rotation (breaking planets spin faster)
-        const spinMult = a.breaking ? 1 + a.breakProgress * 3 : 1;
-        a.mesh.rotateOnAxis(a.rotationAxis, a.angularVel * spinMult * dt);
+        const spinMult = p.breaking ? 1 + p.breakProgress * 3 : 1;
+        p.mesh.rotateOnAxis(p.rotationAxis, p.angularVel * spinMult * dt);
+    }
+
+    // Collision detection using engine (contact distance overlap)
+    const { collisions } = nBodyEngine.detectCollisions();
+    for (const [bi, bj, dist] of collisions) {
+        // Find matching planet objects
+        const a = activePlanets.find(p => p.bodyRef === bi);
+        const b = activePlanets.find(p => p.bodyRef === bj);
+        if (a && b && !a.breaking && !b.breaking) {
+            handleCollision(a, b);
+            // Remove collided bodies from engine (visual breakup system takes over)
+            nBodyEngine.removeBody(bi);
+            nBodyEngine.removeBody(bj);
+            a.bodyRef = null;
+            b.bodyRef = null;
+        }
     }
 
     // Update moons
@@ -1264,6 +1315,12 @@ function setupUI() {
             if (!p.alive) return;
             const dir = p.mesh.position.clone().negate().normalize();
             p.vel.add(dir.multiplyScalar(8));
+            // Sync boost to engine
+            if (p.bodyRef) {
+                p.bodyRef.vx = p.vel.x;
+                p.bodyRef.vy = p.vel.y;
+                p.bodyRef.vz = p.vel.z;
+            }
         });
     });
 
@@ -1312,6 +1369,19 @@ function resetSimulation() {
     moons = [];
     shockwaves = [];
     collisionOccurred = false;
+
+    // Reset physics engine
+    nBodyEngine = new NBodyEngine({
+        G: CONFIG.G,
+        softening: CONFIG.softening,
+        dt: 0.016,
+        integrator: 'yoshida4',
+        adaptiveStep: true,
+        etaParam: 0.02,
+        restitution: 0.3,
+        enableFragmentation: false,
+        trackConservation: true,
+    });
     coalescencePhase = false;
     coalescenceProgress = 0;
     finalPlanet = null;
@@ -1350,7 +1420,8 @@ function animate() {
     if (now - lastFpsTime > 500) {
         const fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
         document.getElementById('fps').textContent = fps;
-        document.getElementById('sim-time').textContent = simTime.toFixed(2);
+        const diag = nBodyEngine.getDiagnostics();
+        document.getElementById('sim-time').textContent = `${simTime.toFixed(2)} | ΔE/E₀: ${diag.energyError.toExponential(2)} | ${diag.integrator}`;
         frameCount = 0;
         lastFpsTime = now;
     }
