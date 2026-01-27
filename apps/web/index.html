@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoupyNBody - Galaxy Simulator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            overflow: hidden;
+            background: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            z-index: 100;
+            user-select: none;
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 300;
+            margin-bottom: 10px;
+            text-shadow: 0 0 10px rgba(100, 150, 255, 0.5);
+        }
+
+        .controls {
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .control-row {
+            margin: 8px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        label {
+            font-size: 12px;
+            color: #aaa;
+            min-width: 100px;
+        }
+
+        input[type="range"] {
+            width: 120px;
+            accent-color: #6af;
+        }
+
+        button {
+            background: rgba(100, 150, 255, 0.3);
+            border: 1px solid rgba(100, 150, 255, 0.5);
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            background: rgba(100, 150, 255, 0.5);
+        }
+
+        .stats {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: #666;
+            font-size: 11px;
+            font-family: monospace;
+        }
+
+        .info {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: #444;
+            font-size: 11px;
+            text-align: right;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #6af;
+            font-size: 18px;
+            z-index: 200;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Initializing galaxy...</div>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui">
+        <h1>SoupyNBody</h1>
+        <div class="controls">
+            <div class="control-row">
+                <label>Particles:</label>
+                <span id="particle-count">10000</span>
+            </div>
+            <div class="control-row">
+                <label>Time Scale:</label>
+                <input type="range" id="time-scale" min="0" max="200" value="100">
+            </div>
+            <div class="control-row">
+                <label>Galaxy Size:</label>
+                <input type="range" id="galaxy-size" min="50" max="200" value="100">
+            </div>
+            <div class="control-row">
+                <button id="btn-pause">Pause</button>
+                <button id="btn-reset">Reset</button>
+                <button id="btn-collision">Collision</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="stats">
+        <div>FPS: <span id="fps">0</span></div>
+        <div>Time: <span id="sim-time">0.00</span></div>
+    </div>
+
+    <div class="info">
+        Drag to rotate • Scroll to zoom<br>
+        WebGL Galaxy Simulator
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module" src="src/main.js"></script>
+</body>
+</html>
