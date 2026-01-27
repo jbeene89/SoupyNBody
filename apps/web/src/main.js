@@ -307,6 +307,21 @@ let debrisPos, debrisVel, debrisLife, debrisColor, debrisMass;
 let debrisActive = false;
 let debrisCount = 0;
 
+// FPV Mode state
+let fpvMode = false;
+let fpvPlanet = null; // which planet we're standing on
+let fpvLat = 0; // latitude on planet surface (radians)
+let fpvLon = 0; // longitude on planet surface (radians)
+let fpvYaw = 0; // horizontal look angle
+let fpvPitch = 0; // vertical look angle
+let fpvMouseDown = false;
+let fpvLastMouseX = 0;
+let fpvLastMouseY = 0;
+let fpvSavedCamPos = null;
+let fpvSavedCamTarget = null;
+let raycaster = null;
+let fpvPointerLocked = false;
+
 function init() {
     // Scene
     scene = new THREE.Scene();
@@ -361,6 +376,9 @@ function init() {
 
     // UI
     setupUI();
+
+    // FPV controls
+    setupFPVControls();
 
     // Window resize
     window.addEventListener('resize', onResize);
@@ -982,6 +1000,24 @@ function setupUI() {
         });
     });
 
+    document.getElementById('btn-fpv').addEventListener('click', () => {
+        if (fpvMode) {
+            exitFPV();
+            return;
+        }
+        // Enter picking mode - user clicks a planet to land on
+        const alive = planets.filter(p => p.alive);
+        if (alive.length === 0) return;
+        // Auto-land on first alive planet, or enable picking
+        if (alive.length === 1) {
+            enterFPV(alive[0]);
+        } else {
+            fpvPickingMode = true;
+            document.getElementById('fpv-info').style.display = 'flex';
+            document.getElementById('fpv-info').querySelector('span').textContent = 'Click a planet to land on it';
+        }
+    });
+
     document.getElementById('time-scale').addEventListener('input', (e) => {
         CONFIG.timeScale = e.target.value / 100 * 2;
     });
@@ -1034,7 +1070,11 @@ function animate() {
         updateShockwaves(dt);
     }
 
-    controls.update();
+    if (fpvMode) {
+        updateFPV();
+    } else {
+        controls.update();
+    }
     composer.render();
 
     // FPS counter
@@ -1063,6 +1103,189 @@ function onResize() {
     renderer.setSize(window.innerWidth, window.innerHeight);
     composer.setSize(window.innerWidth, window.innerHeight);
 }
+
+// ============================================================================
+// FPV (First Person View) - Surface of a Planet
+// ============================================================================
+
+function enterFPV(planet) {
+    if (!planet || !planet.alive) return;
+
+    fpvMode = true;
+    fpvPlanet = planet;
+    fpvYaw = 0;
+    fpvPitch = 0.1;
+    fpvLat = Math.random() * Math.PI * 0.5 - Math.PI * 0.25; // near equator
+    fpvLon = Math.random() * Math.PI * 2;
+
+    // Save camera state
+    fpvSavedCamPos = camera.position.clone();
+    fpvSavedCamTarget = controls.target.clone();
+
+    // Disable orbit controls
+    controls.enabled = false;
+
+    // Show FPV info
+    document.getElementById('fpv-info').style.display = 'flex';
+    document.getElementById('btn-fpv').textContent = 'Exit FPV';
+
+    // Request pointer lock for mouse look
+    renderer.domElement.requestPointerLock();
+}
+
+function exitFPV() {
+    fpvMode = false;
+    fpvPlanet = null;
+
+    // Restore camera
+    if (fpvSavedCamPos) {
+        camera.position.copy(fpvSavedCamPos);
+        controls.target.copy(fpvSavedCamTarget);
+    }
+    camera.up.set(0, 1, 0);
+
+    controls.enabled = true;
+
+    document.getElementById('fpv-info').style.display = 'none';
+    document.getElementById('btn-fpv').textContent = 'FPV Mode';
+
+    // Exit pointer lock
+    if (document.pointerLockElement) {
+        document.exitPointerLock();
+    }
+}
+
+function updateFPV() {
+    if (!fpvMode || !fpvPlanet) return;
+
+    // If the planet we're on got destroyed, eject
+    if (!fpvPlanet.alive) {
+        exitFPV();
+        return;
+    }
+
+    const planet = fpvPlanet;
+    const r = planet.radius;
+    const pos = planet.mesh.position;
+
+    // Slowly rotate longitude with planet's own rotation
+    fpvLon += planet.angularVel * 0.016 * CONFIG.timeScale * 0.1;
+
+    // Surface position in planet local space
+    const surfaceHeight = r * 1.02; // slightly above surface
+    const localX = surfaceHeight * Math.cos(fpvLat) * Math.cos(fpvLon);
+    const localY = surfaceHeight * Math.sin(fpvLat);
+    const localZ = surfaceHeight * Math.cos(fpvLat) * Math.sin(fpvLon);
+
+    // World position = planet center + local offset
+    const camX = pos.x + localX;
+    const camY = pos.y + localY;
+    const camZ = pos.z + localZ;
+
+    camera.position.set(camX, camY, camZ);
+
+    // "Up" direction is away from planet center (surface normal)
+    const up = new THREE.Vector3(localX, localY, localZ).normalize();
+    camera.up.copy(up);
+
+    // Build a look direction from yaw/pitch relative to surface
+    // Tangent basis on the sphere surface
+    const north = new THREE.Vector3(
+        -Math.sin(fpvLat) * Math.cos(fpvLon),
+        Math.cos(fpvLat),
+        -Math.sin(fpvLat) * Math.sin(fpvLon)
+    ).normalize();
+
+    const east = new THREE.Vector3().crossVectors(up, north).normalize();
+    // Recompute north to ensure orthogonality
+    north.crossVectors(east, up).normalize();
+
+    // Look direction from yaw (horizontal) and pitch (vertical)
+    const lookDir = new THREE.Vector3();
+    const cosP = Math.cos(fpvPitch);
+    lookDir.addScaledVector(north, cosP * Math.cos(fpvYaw));
+    lookDir.addScaledVector(east, cosP * Math.sin(fpvYaw));
+    lookDir.addScaledVector(up, Math.sin(fpvPitch));
+    lookDir.normalize();
+
+    const lookTarget = new THREE.Vector3(
+        camX + lookDir.x * 100,
+        camY + lookDir.y * 100,
+        camZ + lookDir.z * 100
+    );
+
+    camera.lookAt(lookTarget);
+}
+
+function setupFPVControls() {
+    raycaster = new THREE.Raycaster();
+
+    // Pointer lock change
+    document.addEventListener('pointerlockchange', () => {
+        fpvPointerLocked = !!document.pointerLockElement;
+    });
+
+    // Mouse move for FPV look
+    document.addEventListener('mousemove', (e) => {
+        if (!fpvMode) return;
+
+        if (fpvPointerLocked) {
+            fpvYaw += e.movementX * 0.003;
+            fpvPitch -= e.movementY * 0.003;
+            fpvPitch = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45, fpvPitch));
+        }
+    });
+
+    // Click to select planet for FPV
+    renderer.domElement.addEventListener('click', (e) => {
+        if (fpvMode && !fpvPointerLocked) {
+            // Re-lock pointer
+            renderer.domElement.requestPointerLock();
+            return;
+        }
+
+        if (fpvMode) return;
+
+        // Only do planet picking if FPV button was recently clicked
+        if (!fpvPickingMode) return;
+
+        const mouse = new THREE.Vector2(
+            (e.clientX / window.innerWidth) * 2 - 1,
+            -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        raycaster.setFromCamera(mouse, camera);
+
+        const meshes = planets.filter(p => p.alive).map(p => p.mesh);
+        const hits = raycaster.intersectObjects(meshes);
+
+        if (hits.length > 0) {
+            const hitMesh = hits[0].object;
+            const planet = planets.find(p => p.mesh === hitMesh);
+            if (planet) {
+                enterFPV(planet);
+                fpvPickingMode = false;
+            }
+        }
+    });
+
+    // ESC to exit FPV
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && fpvMode) {
+            exitFPV();
+        }
+        // WASD to walk on surface
+        if (fpvMode) {
+            const walkSpeed = 0.05;
+            if (e.key === 'w' || e.key === 'W') fpvLat += walkSpeed;
+            if (e.key === 's' || e.key === 'S') fpvLat -= walkSpeed;
+            if (e.key === 'a' || e.key === 'A') fpvLon -= walkSpeed;
+            if (e.key === 'd' || e.key === 'D') fpvLon += walkSpeed;
+            fpvLat = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, fpvLat));
+        }
+    });
+}
+
+let fpvPickingMode = false;
 
 // ============================================================================
 // Start
