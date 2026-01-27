@@ -1105,7 +1105,335 @@ function onResize() {
 }
 
 // ============================================================================
-// FPV (First Person View) - Surface of a Planet
+// FPV - Procedural Terrain (No Man's Sky style)
+// ============================================================================
+
+let terrainGroup = null;
+let terrainSeed = 0;
+let fpvSky = null;
+let fpvSavedFog = null;
+
+// Seeded PRNG
+function mulberry32(a) {
+    return function() {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        let t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+}
+
+// Value noise
+function makeNoise(seed) {
+    const rng = mulberry32(seed);
+    const perm = new Uint8Array(512);
+    for (let i = 0; i < 256; i++) perm[i] = i;
+    for (let i = 255; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [perm[i], perm[j]] = [perm[j], perm[i]];
+    }
+    for (let i = 0; i < 256; i++) perm[i + 256] = perm[i];
+    return function(x, y) {
+        const xi = Math.floor(x) & 255, yi = Math.floor(y) & 255;
+        const xf = x - Math.floor(x), yf = y - Math.floor(y);
+        const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+        const aa = perm[perm[xi] + yi] / 255;
+        const ab = perm[perm[xi] + yi + 1] / 255;
+        const ba = perm[perm[xi + 1] + yi] / 255;
+        const bb = perm[perm[xi + 1] + yi + 1] / 255;
+        return aa + u * (ba - aa) + v * (ab - aa) + u * v * (aa - ba - ab + bb);
+    };
+}
+
+function fbm(fn, x, y, oct, lac, gain) {
+    let v = 0, a = 1, f = 1, m = 0;
+    for (let i = 0; i < oct; i++) { v += fn(x * f, y * f) * a; m += a; a *= gain; f *= lac; }
+    return v / m;
+}
+
+// Biome configs per planet type
+const BIOMES = {
+    molten: {
+        ground: [0x1a0800, 0x331100], rock: 0x220a00, accent: 0xff4400, glow: 0xff6600,
+        sky: [0x110000, 0x331100], fog: [0x220800, 0.04], hScale: 1.5,
+        lava: true, glowFx: true, flora: 'none', rocks: 40,
+    },
+    ice: {
+        ground: [0x99bbdd, 0xddeeff], rock: 0x667788, accent: 0xaaddff, glow: 0x88ccff,
+        sky: [0x112244, 0x88aacc], fog: [0xaabbcc, 0.02], hScale: 0.8,
+        lava: false, glowFx: false, flora: 'ice_crystals', rocks: 25,
+    },
+    gas: {
+        ground: [0xaa7744, 0xddaa66], rock: 0x886633, accent: 0xeebb77, glow: 0xffcc88,
+        sky: [0x443322, 0xcc9955], fog: [0xbb8844, 0.06], hScale: 0.4,
+        lava: false, glowFx: false, flora: 'gas_vents', rocks: 15,
+    },
+    terrestrial: {
+        ground: [0x336622, 0x558833], rock: 0x666655, accent: 0x88aa44, glow: 0x44ff88,
+        sky: [0x1133aa, 0x88bbee], fog: [0x8899aa, 0.012], hScale: 1.2,
+        lava: false, glowFx: false, flora: 'trees', rocks: 30,
+    },
+    toxic: {
+        ground: [0x445500, 0x667700], rock: 0x334400, accent: 0xaacc22, glow: 0xccff44,
+        sky: [0x222200, 0x667700], fog: [0x556600, 0.05], hScale: 1.0,
+        lava: false, glowFx: true, flora: 'mushrooms', rocks: 35,
+    },
+    crystal: {
+        ground: [0x220044, 0x440088], rock: 0x330066, accent: 0xbb66ff, glow: 0xdd99ff,
+        sky: [0x110022, 0x6633aa], fog: [0x331166, 0.025], hScale: 1.8,
+        lava: false, glowFx: true, flora: 'crystals', rocks: 50,
+    },
+};
+
+function getHeight(noise, x, z, hs) {
+    let h = fbm(noise, x * 0.03, z * 0.03, 6, 2.1, 0.48) * hs * 4;
+    const ridge = 1 - Math.abs(fbm(noise, x * 0.02 + 50, z * 0.02 + 50, 4, 2.0, 0.5) * 2 - 1);
+    h += ridge * ridge * hs * 3;
+    h += fbm(noise, x * 0.1, z * 0.1, 3, 2.0, 0.4) * hs * 0.5;
+    return h;
+}
+
+function generateTerrain(planetType) {
+    if (terrainGroup) destroyTerrain();
+    terrainGroup = new THREE.Group();
+    terrainSeed = Math.floor(Math.random() * 99999);
+    const noise = makeNoise(terrainSeed);
+    const b = BIOMES[planetType] || BIOMES.terrestrial;
+    const sz = 120, segs = 200;
+
+    // Ground mesh
+    const gGeo = new THREE.PlaneGeometry(sz, sz, segs, segs);
+    const pa = gGeo.attributes.position;
+    const cols = new Float32Array(pa.count * 3);
+    const c1 = new THREE.Color(b.ground[0]), c2 = new THREE.Color(b.ground[1]), cA = new THREE.Color(b.accent);
+
+    for (let i = 0; i < pa.count; i++) {
+        const x = pa.getX(i), y = pa.getY(i);
+        const h = getHeight(noise, x, y, b.hScale);
+        pa.setZ(i, h);
+        const t = Math.min(1, Math.max(0, h / (b.hScale * 5) * 0.5 + 0.5));
+        const c = c1.clone().lerp(c2, t);
+        if (b.lava && h < b.hScale * 0.3) c.lerp(cA, (1 - h / (b.hScale * 0.3)) * 0.8);
+        if (h > b.hScale * 4) c.lerp(new THREE.Color(0xffffff), (h - b.hScale * 4) * 0.1);
+        cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+    }
+    gGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    gGeo.computeVertexNormals();
+    const ground = new THREE.Mesh(gGeo, new THREE.MeshStandardMaterial({
+        vertexColors: true, roughness: 0.85, metalness: 0.05, flatShading: true,
+    }));
+    ground.rotation.x = -Math.PI / 2;
+    terrainGroup.add(ground);
+
+    const rng = mulberry32(terrainSeed + 1);
+
+    // Rocks
+    for (let i = 0; i < b.rocks; i++) {
+        const rx = (rng() - 0.5) * sz * 0.8, rz = (rng() - 0.5) * sz * 0.8;
+        const ry = getHeight(noise, rx, rz, b.hScale);
+        const s = 0.3 + rng() * 1.5;
+        const rt = rng();
+        const rGeo = rt < 0.3 ? new THREE.DodecahedronGeometry(s, 0) :
+                     rt < 0.6 ? new THREE.OctahedronGeometry(s, 0) :
+                     new THREE.ConeGeometry(s * 0.6, s * 2, 5);
+        const rock = new THREE.Mesh(rGeo, new THREE.MeshStandardMaterial({
+            color: b.rock, roughness: 0.9, metalness: b.glowFx ? 0.3 : 0.05, flatShading: true,
+        }));
+        rock.position.set(rx, ry, rz);
+        rock.rotation.set(rng() * Math.PI, rng() * Math.PI, rng() * Math.PI);
+        terrainGroup.add(rock);
+    }
+
+    // Flora
+    const floraCount = b.flora === 'trees' ? 80 : b.flora === 'crystals' ? 60 :
+                       b.flora === 'mushrooms' ? 50 : b.flora === 'ice_crystals' ? 40 :
+                       b.flora === 'gas_vents' ? 30 : 0;
+    for (let i = 0; i < floraCount; i++) {
+        const fx = (rng() - 0.5) * sz * 0.7, fz = (rng() - 0.5) * sz * 0.7;
+        const fy = getHeight(noise, fx, fz, b.hScale);
+        const obj = b.flora === 'trees' ? makeTree(rng) :
+                    b.flora === 'crystals' ? makeCrystal(rng, b) :
+                    b.flora === 'mushrooms' ? makeMushroom(rng, b) :
+                    b.flora === 'ice_crystals' ? makeIce(rng) :
+                    b.flora === 'gas_vents' ? makeVent(rng, b) : null;
+        if (obj) { obj.position.set(fx, fy, fz); terrainGroup.add(obj); }
+    }
+
+    // Lava pools
+    if (b.lava) {
+        const lr = mulberry32(terrainSeed + 100);
+        for (let i = 0; i < 8; i++) {
+            const px = (lr() - 0.5) * sz * 0.6, pz = (lr() - 0.5) * sz * 0.6;
+            const py = getHeight(noise, px, pz, b.hScale) - 0.1;
+            const ps = 1 + lr() * 4;
+            const pool = new THREE.Mesh(
+                new THREE.CircleGeometry(ps, 12),
+                new THREE.MeshBasicMaterial({ color: b.accent, transparent: true, opacity: 0.8 })
+            );
+            pool.rotation.x = -Math.PI / 2;
+            pool.position.set(px, py, pz);
+            terrainGroup.add(pool);
+            const pl = new THREE.PointLight(b.glow, 3, ps * 4);
+            pl.position.set(px, py + 0.5, pz);
+            terrainGroup.add(pl);
+        }
+    }
+
+    // Glow orbs
+    if (b.glowFx) {
+        for (let i = 0; i < 25; i++) {
+            const gx = (rng() - 0.5) * sz * 0.6, gz = (rng() - 0.5) * sz * 0.6;
+            const gy = getHeight(noise, gx, gz, b.hScale) + 0.1 + rng() * 0.5;
+            const orb = new THREE.Mesh(
+                new THREE.SphereGeometry(0.05 + rng() * 0.15, 6, 6),
+                new THREE.MeshBasicMaterial({ color: b.glow, transparent: true, opacity: 0.6 + rng() * 0.4 })
+            );
+            orb.position.set(gx, gy, gz);
+            terrainGroup.add(orb);
+        }
+        for (let i = 0; i < 6; i++) {
+            const pl = new THREE.PointLight(b.glow, 2, 15);
+            pl.position.set((rng() - 0.5) * 30, 0.5 + rng(), (rng() - 0.5) * 30);
+            terrainGroup.add(pl);
+        }
+    }
+
+    // Lighting
+    terrainGroup.add(new THREE.AmbientLight(b.fog[0], 0.6));
+    const sun = new THREE.DirectionalLight(0xffeedd, 1.5);
+    sun.position.set(30, 50, 20);
+    terrainGroup.add(sun);
+
+    // Sky dome
+    if (fpvSky) { scene.remove(fpvSky); fpvSky.geometry.dispose(); fpvSky.material.dispose(); }
+    fpvSky = new THREE.Mesh(
+        new THREE.SphereGeometry(500, 32, 16),
+        new THREE.ShaderMaterial({
+            uniforms: {
+                topColor: { value: new THREE.Color(b.sky[0]) },
+                botColor: { value: new THREE.Color(b.sky[1]) },
+            },
+            vertexShader: `varying vec3 vWP; void main(){vec4 w=modelMatrix*vec4(position,1.0);vWP=w.xyz;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+            fragmentShader: `uniform vec3 topColor;uniform vec3 botColor;varying vec3 vWP;void main(){float h=normalize(vWP+20.0).y;gl_FragColor=vec4(mix(botColor,topColor,max(pow(max(h,0.0),0.6),0.0)),1.0);}`,
+            side: THREE.BackSide, depthWrite: false,
+        })
+    );
+    scene.add(fpvSky);
+
+    scene.add(terrainGroup);
+}
+
+// Flora builders
+function makeTree(rng) {
+    const g = new THREE.Group();
+    const h = 1 + rng() * 3;
+    g.add(Object.assign(new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.15, h, 5),
+        new THREE.MeshStandardMaterial({ color: 0x553311, roughness: 0.9, flatShading: true })
+    ), { position: new THREE.Vector3(0, h / 2, 0) }));
+    const fc = [0x22aa44, 0x44cc66, 0x118833, 0x66dd88, 0x009955];
+    for (let l = 0; l < 2 + Math.floor(rng() * 3); l++) {
+        const r = 0.5 + rng() * 1.2 - l * 0.15;
+        const shape = rng();
+        const fGeo = shape < 0.3 ? new THREE.SphereGeometry(r, 6, 4) :
+                     shape < 0.6 ? new THREE.DodecahedronGeometry(r, 0) :
+                     new THREE.ConeGeometry(r, r * 1.5, 6);
+        const f = new THREE.Mesh(fGeo, new THREE.MeshStandardMaterial({
+            color: fc[Math.floor(rng() * fc.length)], roughness: 0.8, flatShading: true,
+        }));
+        f.position.y = h * 0.6 + l * 0.6;
+        f.rotation.y = rng() * Math.PI;
+        g.add(f);
+    }
+    return g;
+}
+
+function makeCrystal(rng, b) {
+    const g = new THREE.Group();
+    for (let s = 0; s < 1 + Math.floor(rng() * 4); s++) {
+        const h = 0.5 + rng() * 3, r = 0.1 + rng() * 0.4;
+        const col = new THREE.Color().setHSL(0.7 + rng() * 0.15, 0.8, 0.5 + rng() * 0.3);
+        const shard = new THREE.Mesh(
+            new THREE.ConeGeometry(r, h, 4 + Math.floor(rng() * 3)),
+            new THREE.MeshStandardMaterial({
+                color: col, emissive: col, emissiveIntensity: 0.4 + rng() * 0.4,
+                roughness: 0.1, metalness: 0.8, transparent: true, opacity: 0.7 + rng() * 0.3, flatShading: true,
+            })
+        );
+        shard.position.set((rng() - 0.5) * 0.8, h / 2, (rng() - 0.5) * 0.8);
+        shard.rotation.set((rng() - 0.5) * 0.4, rng() * Math.PI, (rng() - 0.5) * 0.4);
+        g.add(shard);
+    }
+    return g;
+}
+
+function makeMushroom(rng, b) {
+    const g = new THREE.Group();
+    const h = 0.3 + rng() * 1.5, cr = 0.2 + rng() * 0.8;
+    g.add(Object.assign(new THREE.Mesh(
+        new THREE.CylinderGeometry(0.05, 0.08, h, 6),
+        new THREE.MeshStandardMaterial({ color: 0x998866, roughness: 0.9, flatShading: true })
+    ), { position: new THREE.Vector3(0, h / 2, 0) }));
+    g.add(Object.assign(new THREE.Mesh(
+        new THREE.SphereGeometry(cr, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55),
+        new THREE.MeshStandardMaterial({
+            color: b.accent, emissive: new THREE.Color(b.glow), emissiveIntensity: 0.3, roughness: 0.4, flatShading: true,
+        })
+    ), { position: new THREE.Vector3(0, h, 0) }));
+    for (let i = 0; i < 4; i++) {
+        const a = rng() * Math.PI * 2, r2 = cr * 0.5 * rng();
+        g.add(Object.assign(new THREE.Mesh(
+            new THREE.SphereGeometry(cr * 0.12, 4, 4),
+            new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: new THREE.Color(b.glow), emissiveIntensity: 0.6 })
+        ), { position: new THREE.Vector3(Math.cos(a) * r2, h + cr * 0.3, Math.sin(a) * r2) }));
+    }
+    return g;
+}
+
+function makeIce(rng) {
+    const g = new THREE.Group();
+    for (let s = 0; s < 2 + Math.floor(rng() * 5); s++) {
+        const h = 0.5 + rng() * 2.5, r = 0.05 + rng() * 0.2;
+        const spike = new THREE.Mesh(
+            new THREE.CylinderGeometry(0, r, h, 4),
+            new THREE.MeshStandardMaterial({
+                color: 0xccddff, emissive: 0x4488cc, emissiveIntensity: 0.15,
+                roughness: 0.05, metalness: 0.3, transparent: true, opacity: 0.75, flatShading: true,
+            })
+        );
+        spike.position.set((rng() - 0.5) * 0.6, h / 2, (rng() - 0.5) * 0.6);
+        spike.rotation.set((rng() - 0.5) * 0.3, 0, (rng() - 0.5) * 0.3);
+        g.add(spike);
+    }
+    return g;
+}
+
+function makeVent(rng, b) {
+    const g = new THREE.Group();
+    g.add(Object.assign(new THREE.Mesh(
+        new THREE.ConeGeometry(0.5 + rng() * 0.5, 0.3 + rng() * 0.5, 8),
+        new THREE.MeshStandardMaterial({ color: b.rock, roughness: 0.9, flatShading: true })
+    ), { position: new THREE.Vector3(0, 0.15, 0) }));
+    for (let i = 0; i < 12; i++) {
+        g.add(Object.assign(new THREE.Mesh(
+            new THREE.SphereGeometry(0.1 + rng() * 0.3, 4, 4),
+            new THREE.MeshBasicMaterial({ color: b.accent, transparent: true, opacity: 0.15 + rng() * 0.2 })
+        ), { position: new THREE.Vector3((rng() - 0.5) * 0.8, 0.5 + rng() * 3, (rng() - 0.5) * 0.8) }));
+    }
+    return g;
+}
+
+function destroyTerrain() {
+    if (terrainGroup) {
+        scene.remove(terrainGroup);
+        terrainGroup.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
+        terrainGroup = null;
+    }
+    if (fpvSky) { scene.remove(fpvSky); fpvSky.geometry.dispose(); fpvSky.material.dispose(); fpvSky = null; }
+}
+
+// ============================================================================
+// FPV enter / exit / update
 // ============================================================================
 
 function enterFPV(planet) {
@@ -1115,174 +1443,128 @@ function enterFPV(planet) {
     fpvPlanet = planet;
     fpvYaw = 0;
     fpvPitch = 0.1;
-    fpvLat = Math.random() * Math.PI * 0.5 - Math.PI * 0.25; // near equator
-    fpvLon = Math.random() * Math.PI * 2;
+    fpvLat = 0;
+    fpvLon = 0;
 
-    // Save camera state
     fpvSavedCamPos = camera.position.clone();
     fpvSavedCamTarget = controls.target.clone();
-
-    // Disable orbit controls
     controls.enabled = false;
 
-    // Show FPV info
+    camera.near = 0.01;
+    camera.far = 1000;
+    camera.updateProjectionMatrix();
+
+    planet.mesh.visible = false;
+
+    generateTerrain(planet.type.type);
+
+    fpvSavedFog = scene.fog;
+    const b = BIOMES[planet.type.type] || BIOMES.terrestrial;
+    scene.fog = new THREE.FogExp2(b.fog[0], b.fog[1]);
+
     document.getElementById('fpv-info').style.display = 'flex';
     document.getElementById('btn-fpv').textContent = 'Exit FPV';
 
-    // Request pointer lock for mouse look
     renderer.domElement.requestPointerLock();
 }
 
 function exitFPV() {
+    if (fpvPlanet) fpvPlanet.mesh.visible = true;
     fpvMode = false;
     fpvPlanet = null;
 
-    // Restore camera
+    destroyTerrain();
+
     if (fpvSavedCamPos) {
         camera.position.copy(fpvSavedCamPos);
         controls.target.copy(fpvSavedCamTarget);
     }
     camera.up.set(0, 1, 0);
+    camera.near = 0.1;
+    camera.far = 2000;
+    camera.updateProjectionMatrix();
 
+    if (fpvSavedFog) { scene.fog = fpvSavedFog; fpvSavedFog = null; }
     controls.enabled = true;
 
     document.getElementById('fpv-info').style.display = 'none';
     document.getElementById('btn-fpv').textContent = 'FPV Mode';
-
-    // Exit pointer lock
-    if (document.pointerLockElement) {
-        document.exitPointerLock();
-    }
+    if (document.pointerLockElement) document.exitPointerLock();
 }
 
 function updateFPV() {
     if (!fpvMode || !fpvPlanet) return;
+    if (!fpvPlanet.alive) { exitFPV(); return; }
 
-    // If the planet we're on got destroyed, eject
-    if (!fpvPlanet.alive) {
-        exitFPV();
-        return;
-    }
+    const b = BIOMES[fpvPlanet.type.type] || BIOMES.terrestrial;
+    const wp = fpvPlanet.mesh.position;
 
-    const planet = fpvPlanet;
-    const r = planet.radius;
-    const pos = planet.mesh.position;
+    terrainGroup.position.copy(wp);
+    if (fpvSky) fpvSky.position.copy(wp);
 
-    // Slowly rotate longitude with planet's own rotation
-    fpvLon += planet.angularVel * 0.016 * CONFIG.timeScale * 0.1;
+    const walkX = fpvLon * 15, walkZ = fpvLat * 15;
+    const noise = makeNoise(terrainSeed);
+    const groundY = getHeight(noise, walkX, walkZ, b.hScale);
 
-    // Surface position in planet local space
-    const surfaceHeight = r * 1.02; // slightly above surface
-    const localX = surfaceHeight * Math.cos(fpvLat) * Math.cos(fpvLon);
-    const localY = surfaceHeight * Math.sin(fpvLat);
-    const localZ = surfaceHeight * Math.cos(fpvLat) * Math.sin(fpvLon);
+    camera.position.set(wp.x + walkX, wp.y + groundY + 0.4, wp.z + walkZ);
+    camera.up.set(0, 1, 0);
 
-    // World position = planet center + local offset
-    const camX = pos.x + localX;
-    const camY = pos.y + localY;
-    const camZ = pos.z + localZ;
-
-    camera.position.set(camX, camY, camZ);
-
-    // "Up" direction is away from planet center (surface normal)
-    const up = new THREE.Vector3(localX, localY, localZ).normalize();
-    camera.up.copy(up);
-
-    // Build a look direction from yaw/pitch relative to surface
-    // Tangent basis on the sphere surface
-    const north = new THREE.Vector3(
-        -Math.sin(fpvLat) * Math.cos(fpvLon),
-        Math.cos(fpvLat),
-        -Math.sin(fpvLat) * Math.sin(fpvLon)
-    ).normalize();
-
-    const east = new THREE.Vector3().crossVectors(up, north).normalize();
-    // Recompute north to ensure orthogonality
-    north.crossVectors(east, up).normalize();
-
-    // Look direction from yaw (horizontal) and pitch (vertical)
-    const lookDir = new THREE.Vector3();
-    const cosP = Math.cos(fpvPitch);
-    lookDir.addScaledVector(north, cosP * Math.cos(fpvYaw));
-    lookDir.addScaledVector(east, cosP * Math.sin(fpvYaw));
-    lookDir.addScaledVector(up, Math.sin(fpvPitch));
-    lookDir.normalize();
-
-    const lookTarget = new THREE.Vector3(
-        camX + lookDir.x * 100,
-        camY + lookDir.y * 100,
-        camZ + lookDir.z * 100
+    const ld = new THREE.Vector3(
+        Math.sin(fpvYaw) * Math.cos(fpvPitch),
+        Math.sin(fpvPitch),
+        Math.cos(fpvYaw) * Math.cos(fpvPitch)
     );
-
-    camera.lookAt(lookTarget);
+    camera.lookAt(camera.position.x + ld.x, camera.position.y + ld.y, camera.position.z + ld.z);
 }
 
 function setupFPVControls() {
     raycaster = new THREE.Raycaster();
 
-    // Pointer lock change
     document.addEventListener('pointerlockchange', () => {
         fpvPointerLocked = !!document.pointerLockElement;
     });
 
-    // Mouse move for FPV look
     document.addEventListener('mousemove', (e) => {
-        if (!fpvMode) return;
-
-        if (fpvPointerLocked) {
-            fpvYaw += e.movementX * 0.003;
-            fpvPitch -= e.movementY * 0.003;
-            fpvPitch = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45, fpvPitch));
-        }
+        if (!fpvMode || !fpvPointerLocked) return;
+        fpvYaw += e.movementX * 0.003;
+        fpvPitch -= e.movementY * 0.003;
+        fpvPitch = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45, fpvPitch));
     });
 
-    // Click to select planet for FPV
     renderer.domElement.addEventListener('click', (e) => {
-        if (fpvMode && !fpvPointerLocked) {
-            // Re-lock pointer
-            renderer.domElement.requestPointerLock();
-            return;
-        }
-
-        if (fpvMode) return;
-
-        // Only do planet picking if FPV button was recently clicked
-        if (!fpvPickingMode) return;
+        if (fpvMode && !fpvPointerLocked) { renderer.domElement.requestPointerLock(); return; }
+        if (fpvMode || !fpvPickingMode) return;
 
         const mouse = new THREE.Vector2(
             (e.clientX / window.innerWidth) * 2 - 1,
             -(e.clientY / window.innerHeight) * 2 + 1
         );
         raycaster.setFromCamera(mouse, camera);
-
-        const meshes = planets.filter(p => p.alive).map(p => p.mesh);
-        const hits = raycaster.intersectObjects(meshes);
-
+        const hits = raycaster.intersectObjects(planets.filter(p => p.alive).map(p => p.mesh));
         if (hits.length > 0) {
-            const hitMesh = hits[0].object;
-            const planet = planets.find(p => p.mesh === hitMesh);
-            if (planet) {
-                enterFPV(planet);
-                fpvPickingMode = false;
-            }
+            const p = planets.find(pl => pl.mesh === hits[0].object);
+            if (p) { enterFPV(p); fpvPickingMode = false; }
         }
     });
 
-    // ESC to exit FPV
+    const keys = {};
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && fpvMode) {
-            exitFPV();
-        }
-        // WASD to walk on surface
-        if (fpvMode) {
-            const walkSpeed = 0.05;
-            if (e.key === 'w' || e.key === 'W') fpvLat += walkSpeed;
-            if (e.key === 's' || e.key === 'S') fpvLat -= walkSpeed;
-            if (e.key === 'a' || e.key === 'A') fpvLon -= walkSpeed;
-            if (e.key === 'd' || e.key === 'D') fpvLon += walkSpeed;
-            fpvLat = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, fpvLat));
-        }
+        keys[e.key.toLowerCase()] = true;
+        if (e.key === 'Escape' && fpvMode) exitFPV();
     });
+    document.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+    (function walkLoop() {
+        requestAnimationFrame(walkLoop);
+        if (!fpvMode) return;
+        const sp = 0.02;
+        const fwd = sp * ((keys['w'] ? 1 : 0) - (keys['s'] ? 1 : 0));
+        const str = sp * ((keys['d'] ? 1 : 0) - (keys['a'] ? 1 : 0));
+        if (fwd || str) {
+            fpvLon += Math.sin(fpvYaw) * fwd + Math.cos(fpvYaw) * str;
+            fpvLat += Math.cos(fpvYaw) * fwd - Math.sin(fpvYaw) * str;
+        }
+    })();
 }
 
 let fpvPickingMode = false;
