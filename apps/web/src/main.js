@@ -570,34 +570,66 @@ function spawnDebris(posA, posB, velA, velB, typeA, typeB, totalMass) {
     const colorsA = typeA.colors;
     const colorsB = typeB.colors;
 
+    // Impact velocity magnitude for scaling debris speed
+    const impactSpeed = Math.sqrt(
+        (velA.x - velB.x) ** 2 + (velA.y - velB.y) ** 2 + (velA.z - velB.z) ** 2
+    );
+    // Collision axis (direction between planets)
+    const colAxisX = posB.x - posA.x, colAxisY = posB.y - posA.y, colAxisZ = posB.z - posA.z;
+    const colAxisLen = Math.sqrt(colAxisX * colAxisX + colAxisY * colAxisY + colAxisZ * colAxisZ) + 0.01;
+    const cax = colAxisX / colAxisLen, cay = colAxisY / colAxisLen, caz = colAxisZ / colAxisLen;
+
+    const combinedRadius = typeA.radius + typeB.radius;
+
     for (let i = 0; i < count; i++) {
         const i3 = i * 3;
 
-        // Position: spread around collision point
-        const spread = 3 + Math.random() * 5;
-        debrisPos[i3] = midX + (Math.random() - 0.5) * spread;
-        debrisPos[i3+1] = midY + (Math.random() - 0.5) * spread;
-        debrisPos[i3+2] = midZ + (Math.random() - 0.5) * spread;
-
-        // Velocity: explosive + inherited momentum
-        const speed = 5 + Math.random() * 25;
+        // Spawn debris distributed along both planet volumes, not just the center
+        const fromA = Math.random() > 0.5;
+        const srcPos = fromA ? posA : posB;
+        const srcR = fromA ? typeA.radius : typeB.radius;
+        // Random position within planet volume
         const theta = Math.random() * Math.PI * 2;
         const phi = Math.acos(2 * Math.random() - 1);
-        debrisVel[i3] = avgVelX + Math.sin(phi) * Math.cos(theta) * speed;
-        debrisVel[i3+1] = avgVelY + Math.sin(phi) * Math.sin(theta) * speed;
-        debrisVel[i3+2] = avgVelZ + Math.cos(phi) * speed;
+        const rDist = srcR * Math.cbrt(Math.random()); // cube root for uniform volume
+        debrisPos[i3] = srcPos.x + Math.sin(phi) * Math.cos(theta) * rDist;
+        debrisPos[i3+1] = srcPos.y + Math.sin(phi) * Math.sin(theta) * rDist;
+        debrisPos[i3+2] = srcPos.z + Math.cos(phi) * rDist;
 
-        debrisLife[i] = 1.0;
+        // Velocity: mostly inherited momentum + mild random ejection
+        // Fragments near the impact seam move faster; ones on the far side drift slowly
+        const dx = debrisPos[i3] - midX;
+        const dy = debrisPos[i3+1] - midY;
+        const dz = debrisPos[i3+2] - midZ;
+        const distFromImpact = Math.sqrt(dx*dx + dy*dy + dz*dz) + 0.01;
+        const nearImpact = Math.max(0, 1 - distFromImpact / combinedRadius);
+
+        // Eject along direction away from center, scaled by proximity to impact
+        const ejectSpeed = (0.5 + nearImpact * 3) * (0.3 + impactSpeed * 0.15);
+        const ex = dx / distFromImpact;
+        const ey = dy / distFromImpact;
+        const ez = dz / distFromImpact;
+
+        // Inherit parent velocity
+        const srcVel = fromA ? velA : velB;
+        debrisVel[i3] = srcVel.x * 0.8 + ex * ejectSpeed + (Math.random() - 0.5) * 1.5;
+        debrisVel[i3+1] = srcVel.y * 0.8 + ey * ejectSpeed + (Math.random() - 0.5) * 1.5;
+        debrisVel[i3+2] = srcVel.z * 0.8 + ez * ejectSpeed + (Math.random() - 0.5) * 1.5;
+
+        // Stagger spawn: some debris "activates" later (delayed breakup)
+        // Life > 1.0 means it hasn't appeared yet (countdown)
+        const delay = Math.random() * Math.random() * 2.0; // most spawn quickly, some delayed
+        debrisLife[i] = 1.0 + delay;
+
         debrisMass[i] = totalMass / count;
 
-        // Color from either planet
-        const c = Math.random() > 0.5 ? colorsA : colorsB;
+        // Color from source planet (not random mix)
+        const c = fromA ? colorsA : colorsB;
         const ci = Math.floor(Math.random() * c.length);
         const col = new THREE.Color(c[ci]);
-        // Add some hot white/orange for fresh debris
-        const heat = Math.random();
-        if (heat > 0.7) {
-            col.lerp(new THREE.Color(0xffffaa), heat - 0.7);
+        // Subtle heat glow only near the impact seam
+        if (nearImpact > 0.6) {
+            col.lerp(new THREE.Color(0xff6633), (nearImpact - 0.6) * 0.5);
         }
         debrisColor[i3] = col.r;
         debrisColor[i3+1] = col.g;
@@ -611,38 +643,43 @@ function spawnDebris(posA, posB, velA, velB, typeA, typeB, totalMass) {
     debrisCount = count;
 }
 
-function createShockwave(position) {
-    const geo = new THREE.RingGeometry(0.1, 1, 64);
-    const mat = new THREE.MeshBasicMaterial({
-        color: 0xffffff,
+function createImpactEffects(position, radiusA, radiusB) {
+    // Subtle dust/debris cloud that expands slowly - no bright flash
+    const combinedR = radiusA + radiusB;
+
+    // Expanding dust ring along the collision plane
+    const ringGeo = new THREE.RingGeometry(combinedR * 0.3, combinedR * 0.6, 32);
+    const ringMat = new THREE.MeshBasicMaterial({
+        color: 0x886644,
         transparent: true,
-        opacity: 0.8,
+        opacity: 0.35,
         side: THREE.DoubleSide,
     });
-    const ring = new THREE.Mesh(geo, mat);
+    const ring = new THREE.Mesh(ringGeo, ringMat);
     ring.position.copy(position);
     ring.lookAt(camera.position);
     scene.add(ring);
-    shockwaves.push({ mesh: ring, scale: 1, opacity: 0.8 });
+    shockwaves.push({ mesh: ring, scale: 1, opacity: 0.35, isDust: true });
 
-    // Second shockwave perpendicular
-    const ring2 = ring.clone();
-    ring2.material = mat.clone();
-    ring2.rotation.x += Math.PI / 2;
+    // A second ring on perpendicular plane
+    const ring2Geo = new THREE.RingGeometry(combinedR * 0.2, combinedR * 0.5, 32);
+    const ring2 = new THREE.Mesh(ring2Geo, ringMat.clone());
+    ring2.position.copy(position);
+    ring2.rotation.x = Math.PI / 2;
     scene.add(ring2);
-    shockwaves.push({ mesh: ring2, scale: 1, opacity: 0.8 });
+    shockwaves.push({ mesh: ring2, scale: 1, opacity: 0.3, isDust: true });
 
-    // Flash
-    const flashGeo = new THREE.SphereGeometry(2, 16, 16);
-    const flashMat = new THREE.MeshBasicMaterial({
-        color: 0xffffff,
+    // Warm glow at impact point (not a flash, a slow burn)
+    const glowGeo = new THREE.SphereGeometry(combinedR * 0.4, 16, 16);
+    const glowMat = new THREE.MeshBasicMaterial({
+        color: 0xff6633,
         transparent: true,
-        opacity: 1,
+        opacity: 0.4,
     });
-    const flash = new THREE.Mesh(flashGeo, flashMat);
-    flash.position.copy(position);
-    scene.add(flash);
-    shockwaves.push({ mesh: flash, scale: 2, opacity: 1, isFlash: true });
+    const glow = new THREE.Mesh(glowGeo, glowMat);
+    glow.position.copy(position);
+    scene.add(glow);
+    shockwaves.push({ mesh: glow, scale: 1, opacity: 0.4, isGlow: true });
 }
 
 // ============================================================================
@@ -656,8 +693,9 @@ function updatePhysics(dt) {
     }
 
     const activePlanets = planets.filter(p => p.alive);
+    const intactPlanets = activePlanets.filter(p => !p.breaking);
 
-    // Planet-planet gravity and collision detection
+    // Planet-planet gravity and collision detection (only intact planets collide)
     for (let i = 0; i < activePlanets.length; i++) {
         const a = activePlanets[i];
         for (let j = i + 1; j < activePlanets.length; j++) {
@@ -682,8 +720,8 @@ function updatePhysics(dt) {
             b.vel.y -= fy / b.mass * dt;
             b.vel.z -= fz / b.mass * dt;
 
-            // Collision detection
-            if (dist < (a.radius + b.radius) * 0.9) {
+            // Collision detection (only intact planets)
+            if (!a.breaking && !b.breaking && dist < (a.radius + b.radius) * 0.9) {
                 handleCollision(a, b);
             }
         }
@@ -693,8 +731,9 @@ function updatePhysics(dt) {
         a.mesh.position.y += a.vel.y * dt;
         a.mesh.position.z += a.vel.z * dt;
 
-        // Rotation
-        a.mesh.rotateOnAxis(a.rotationAxis, a.angularVel * dt);
+        // Rotation (breaking planets spin faster)
+        const spinMult = a.breaking ? 1 + a.breakProgress * 3 : 1;
+        a.mesh.rotateOnAxis(a.rotationAxis, a.angularVel * spinMult * dt);
     }
 
     // Update moons
@@ -746,10 +785,19 @@ function updatePhysics(dt) {
     }
 }
 
+// Collision state for gradual breakup
+let breakingPlanets = []; // planets mid-breakup
+let collisionChunks = []; // large rock chunks
+
 function handleCollision(a, b) {
     collisionOccurred = true;
 
-    // Spawn debris
+    const mid = a.mesh.position.clone().add(b.mesh.position).multiplyScalar(0.5);
+
+    // Subtle impact effects (dust cloud + warm glow, no nuke flash)
+    createImpactEffects(mid, a.radius, b.radius);
+
+    // Spawn debris from both planets
     spawnDebris(
         a.mesh.position, b.mesh.position,
         a.vel, b.vel,
@@ -757,23 +805,112 @@ function handleCollision(a, b) {
         a.mass + b.mass
     );
 
-    // Shockwave
+    // Spawn large chunks (mesh fragments that drift and tumble)
+    spawnChunks(a, b);
+
+    // Start gradual breakup: planets don't vanish instantly
+    // They deform (squash), glow at impact seam, then fade/shrink over time
+    a.breaking = true;
+    a.breakProgress = 0;
+    b.breaking = true;
+    b.breakProgress = 0;
+
+    // Squash direction is along the collision axis
+    const collisionDir = b.mesh.position.clone().sub(a.mesh.position).normalize();
+    a.breakAxis = collisionDir.clone();
+    b.breakAxis = collisionDir.clone().negate();
+
+    // Add impact seam glow to both planets
+    addImpactGlow(a, collisionDir);
+    addImpactGlow(b, collisionDir.clone().negate());
+
+    // Slow them down (inelastic collision absorbs energy)
+    const totalMass = a.mass + b.mass;
+    const mergedVx = (a.vel.x * a.mass + b.vel.x * b.mass) / totalMass;
+    const mergedVy = (a.vel.y * a.mass + b.vel.y * b.mass) / totalMass;
+    const mergedVz = (a.vel.z * a.mass + b.vel.z * b.mass) / totalMass;
+    // Push apart slightly
+    a.vel.set(mergedVx - collisionDir.x * 0.5, mergedVy - collisionDir.y * 0.5, mergedVz - collisionDir.z * 0.5);
+    b.vel.set(mergedVx + collisionDir.x * 0.5, mergedVy + collisionDir.y * 0.5, mergedVz + collisionDir.z * 0.5);
+
+    breakingPlanets.push(a, b);
+}
+
+function addImpactGlow(planet, dir) {
+    // Add a glowing hemisphere on the impact side
+    const glowGeo = new THREE.SphereGeometry(planet.radius * 1.02, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.5);
+    const glowMat = new THREE.MeshBasicMaterial({
+        color: 0xff5522,
+        transparent: true,
+        opacity: 0.5,
+    });
+    const glow = new THREE.Mesh(glowGeo, glowMat);
+    // Orient hemisphere toward impact direction
+    glow.lookAt(dir);
+    planet.mesh.add(glow);
+    planet.impactGlow = glow;
+}
+
+function spawnChunks(a, b) {
+    const chunkCount = 6 + Math.floor(Math.random() * 6);
     const mid = a.mesh.position.clone().add(b.mesh.position).multiplyScalar(0.5);
-    createShockwave(mid);
 
-    // Remove both planets
-    a.alive = false;
-    b.alive = false;
-    scene.remove(a.mesh);
-    scene.remove(b.mesh);
+    for (let i = 0; i < chunkCount; i++) {
+        const fromA = Math.random() > 0.5;
+        const srcPlanet = fromA ? a : b;
+        const srcR = srcPlanet.radius;
 
-    // Check if this was the last pair - trigger coalescence after a delay
-    const remaining = planets.filter(p => p.alive);
-    if (remaining.length === 0) {
-        // Store collision center and combined properties
-        setTimeout(() => {
-            startCoalescence(mid, a, b);
-        }, 3000);
+        // Chunk size proportional to planet
+        const chunkScale = srcR * (0.15 + Math.random() * 0.35);
+        const geoType = Math.random();
+        const geo = geoType < 0.4 ? new THREE.DodecahedronGeometry(chunkScale, 0) :
+                    geoType < 0.7 ? new THREE.OctahedronGeometry(chunkScale, 0) :
+                    new THREE.TetrahedronGeometry(chunkScale, 0);
+
+        const ci = Math.floor(Math.random() * srcPlanet.type.colors.length);
+        const col = new THREE.Color(srcPlanet.type.colors[ci]);
+        // Darken chunks slightly
+        col.multiplyScalar(0.7 + Math.random() * 0.3);
+
+        const mat = new THREE.MeshStandardMaterial({
+            color: col,
+            emissive: new THREE.Color(0xff4400),
+            emissiveIntensity: 0.15 + Math.random() * 0.25,
+            roughness: 0.85,
+            metalness: 0.1,
+            flatShading: true,
+        });
+
+        const chunk = new THREE.Mesh(geo, mat);
+        // Spawn from planet surface
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        chunk.position.set(
+            srcPlanet.mesh.position.x + Math.sin(phi) * Math.cos(theta) * srcR * 0.8,
+            srcPlanet.mesh.position.y + Math.sin(phi) * Math.sin(theta) * srcR * 0.8,
+            srcPlanet.mesh.position.z + Math.cos(phi) * srcR * 0.8,
+        );
+        chunk.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+        scene.add(chunk);
+
+        // Velocity: inherit planet + mild outward + random tumble
+        const outDir = chunk.position.clone().sub(mid).normalize();
+        const speed = 0.5 + Math.random() * 2;
+        collisionChunks.push({
+            mesh: chunk,
+            vel: new THREE.Vector3(
+                srcPlanet.vel.x * 0.6 + outDir.x * speed + (Math.random() - 0.5) * 0.8,
+                srcPlanet.vel.y * 0.6 + outDir.y * speed + (Math.random() - 0.5) * 0.8,
+                srcPlanet.vel.z * 0.6 + outDir.z * speed + (Math.random() - 0.5) * 0.8,
+            ),
+            angVel: new THREE.Vector3(
+                (Math.random() - 0.5) * 3,
+                (Math.random() - 0.5) * 3,
+                (Math.random() - 0.5) * 3,
+            ),
+            life: 1.0,
+            coolRate: 0.01 + Math.random() * 0.02,
+        });
     }
 }
 
@@ -899,12 +1036,25 @@ function updateDebris(dt, activePlanets) {
 
     for (let i = 0; i < debrisCount; i++) {
         if (debrisLife[i] <= 0) continue;
-        aliveCount++;
 
         const i3 = i * 3;
 
-        // Gravity from surviving planets
+        // Staggered spawn: life > 1.0 means counting down to activation
+        if (debrisLife[i] > 1.0) {
+            debrisLife[i] -= dt;
+            // Hide off-screen until active
+            debrisPos[i3] = 99999;
+            debrisPos[i3+1] = 99999;
+            debrisPos[i3+2] = 99999;
+            aliveCount++;
+            continue;
+        }
+
+        aliveCount++;
+
+        // Gravity from ALL surviving planets (debris interacts with remaining bodies)
         for (const p of activePlanets) {
+            if (p.breaking) continue; // skip planets mid-breakup
             const dx = p.mesh.position.x - debrisPos[i3];
             const dy = p.mesh.position.y - debrisPos[i3+1];
             const dz = p.mesh.position.z - debrisPos[i3+2];
@@ -914,12 +1064,32 @@ function updateDebris(dt, activePlanets) {
             debrisVel[i3] += F * dx / dist * dt;
             debrisVel[i3+1] += F * dy / dist * dt;
             debrisVel[i3+2] += F * dz / dist * dt;
+
+            // Debris captured by a planet (close approach)
+            if (dist < p.radius * 1.2) {
+                debrisLife[i] -= dt * 0.5; // absorbed faster near planets
+            }
         }
 
-        // Particle-particle interaction for nearby debris (every 100th for performance)
-        if (i % 50 === frameCount % 50) {
-            for (let j = i + 1; j < Math.min(i + 200, debrisCount); j++) {
-                if (debrisLife[j] <= 0) continue;
+        // Gravity from collision chunks too
+        for (const ch of collisionChunks) {
+            const dx = ch.mesh.position.x - debrisPos[i3];
+            const dy = ch.mesh.position.y - debrisPos[i3+1];
+            const dz = ch.mesh.position.z - debrisPos[i3+2];
+            const dist2 = dx*dx + dy*dy + dz*dz + 0.5;
+            if (dist2 < 100) {
+                const dist = Math.sqrt(dist2);
+                const F = CONFIG.G * 2 / dist2;
+                debrisVel[i3] += F * dx / dist * dt;
+                debrisVel[i3+1] += F * dy / dist * dt;
+                debrisVel[i3+2] += F * dz / dist * dt;
+            }
+        }
+
+        // Sparse particle-particle interaction
+        if (i % 80 === frameCount % 80) {
+            for (let j = i + 1; j < Math.min(i + 150, debrisCount); j++) {
+                if (debrisLife[j] <= 0 || debrisLife[j] > 1.0) continue;
                 const j3 = j * 3;
                 const dx = debrisPos[j3] - debrisPos[i3];
                 const dy = debrisPos[j3+1] - debrisPos[i3+1];
@@ -939,13 +1109,12 @@ function updateDebris(dt, activePlanets) {
         debrisPos[i3+1] += debrisVel[i3+1] * dt;
         debrisPos[i3+2] += debrisVel[i3+2] * dt;
 
-        // Slow fade
-        debrisLife[i] -= dt * 0.01;
+        // Very slow fade (long-lived debris field)
+        debrisLife[i] -= dt * 0.005;
 
-        // Color cooling effect
-        if (debrisColor[i3] > 0.3) {
-            debrisColor[i3] -= dt * 0.02;
-        }
+        // Gradual color cooling (warm orange → natural color over time)
+        const coolRate = dt * 0.008;
+        if (debrisColor[i3] > 0.2) debrisColor[i3] -= coolRate;
     }
 
     debris.geometry.attributes.position.needsUpdate = true;
@@ -959,13 +1128,19 @@ function updateDebris(dt, activePlanets) {
 function updateShockwaves(dt) {
     for (let i = shockwaves.length - 1; i >= 0; i--) {
         const sw = shockwaves[i];
-        if (sw.isFlash) {
-            sw.scale += dt * 30;
-            sw.opacity -= dt * 3;
+        if (sw.isDust) {
+            // Slow expanding dust cloud
+            sw.scale += dt * 8;
+            sw.opacity -= dt * 0.15;
+            sw.mesh.scale.setScalar(sw.scale);
+        } else if (sw.isGlow) {
+            // Warm glow that slowly fades over time (slow burn)
+            sw.scale += dt * 1.5;
+            sw.opacity -= dt * 0.05;
             sw.mesh.scale.setScalar(sw.scale);
         } else {
-            sw.scale += CONFIG.shockwaveSpeed * dt;
-            sw.opacity -= dt * 0.8;
+            sw.scale += dt * 5;
+            sw.opacity -= dt * 0.3;
             sw.mesh.scale.setScalar(sw.scale);
         }
         sw.mesh.material.opacity = Math.max(0, sw.opacity);
@@ -973,6 +1148,98 @@ function updateShockwaves(dt) {
         if (sw.opacity <= 0) {
             scene.remove(sw.mesh);
             shockwaves.splice(i, 1);
+        }
+    }
+
+    // Update breaking planets (gradual deformation and fade)
+    for (let i = breakingPlanets.length - 1; i >= 0; i--) {
+        const p = breakingPlanets[i];
+        if (!p.breaking) { breakingPlanets.splice(i, 1); continue; }
+
+        p.breakProgress += dt * 0.3; // slow breakup over ~3 seconds
+
+        // Squash along collision axis, stretch perpendicular
+        const squash = 1 - p.breakProgress * 0.5;
+        const stretch = 1 + p.breakProgress * 0.3;
+        p.mesh.scale.set(
+            stretch,
+            stretch,
+            Math.max(0.1, squash)
+        );
+        // Orient squash toward collision axis
+        p.mesh.lookAt(
+            p.mesh.position.x + p.breakAxis.x,
+            p.mesh.position.y + p.breakAxis.y,
+            p.mesh.position.z + p.breakAxis.z
+        );
+
+        // Fade impact glow (slow burn, not flash)
+        if (p.impactGlow) {
+            p.impactGlow.material.opacity = Math.max(0, 0.5 - p.breakProgress * 0.15);
+            // Color shifts from orange to deep red as it cools
+            const coolT = Math.min(1, p.breakProgress * 0.4);
+            p.impactGlow.material.color.setRGB(1 - coolT * 0.3, 0.3 - coolT * 0.2, 0.1 - coolT * 0.05);
+        }
+
+        // Shrink and fade the planet itself
+        if (p.breakProgress > 0.5) {
+            const fadeT = (p.breakProgress - 0.5) * 2;
+            p.mesh.material.opacity = 1 - fadeT;
+            p.mesh.material.transparent = true;
+        }
+
+        // Finally remove when fully broken
+        if (p.breakProgress >= 1.0) {
+            p.alive = false;
+            p.breaking = false;
+            scene.remove(p.mesh);
+            breakingPlanets.splice(i, 1);
+
+            // Check for coalescence trigger
+            const remaining = planets.filter(pl => pl.alive && !pl.breaking);
+            if (remaining.length === 0) {
+                const mid = p.mesh.position.clone();
+                const otherBroken = planets.find(pl => pl !== p && pl.breaking === false && !pl.alive);
+                if (otherBroken) {
+                    setTimeout(() => startCoalescence(mid, p, otherBroken), 4000);
+                }
+            }
+        }
+    }
+
+    // Update chunks (tumbling rock fragments)
+    for (let i = collisionChunks.length - 1; i >= 0; i--) {
+        const ch = collisionChunks[i];
+        ch.mesh.position.x += ch.vel.x * dt;
+        ch.mesh.position.y += ch.vel.y * dt;
+        ch.mesh.position.z += ch.vel.z * dt;
+        ch.mesh.rotation.x += ch.angVel.x * dt;
+        ch.mesh.rotation.y += ch.angVel.y * dt;
+        ch.mesh.rotation.z += ch.angVel.z * dt;
+
+        // Slow emissive cooling
+        ch.mesh.material.emissiveIntensity = Math.max(0, ch.mesh.material.emissiveIntensity - ch.coolRate * dt);
+
+        // Gravity from surviving planets
+        for (const p of planets) {
+            if (!p.alive || p.breaking) continue;
+            const dx = p.mesh.position.x - ch.mesh.position.x;
+            const dy = p.mesh.position.y - ch.mesh.position.y;
+            const dz = p.mesh.position.z - ch.mesh.position.z;
+            const dist2 = dx*dx + dy*dy + dz*dz + 1;
+            const dist = Math.sqrt(dist2);
+            const F = CONFIG.G * p.mass * 0.5 / dist2;
+            ch.vel.x += F * dx / dist * dt;
+            ch.vel.y += F * dy / dist * dt;
+            ch.vel.z += F * dz / dist * dt;
+        }
+
+        ch.life -= dt * 0.03;
+        if (ch.life <= 0) {
+            scene.remove(ch.mesh);
+            ch.mesh.geometry.dispose();
+            ch.mesh.material.dispose();
+            collisionChunks.splice(i, 1);
         }
     }
 }
