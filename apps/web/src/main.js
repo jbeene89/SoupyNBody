@@ -1112,6 +1112,8 @@ let terrainGroup = null;
 let terrainSeed = 0;
 let fpvSky = null;
 let fpvSavedFog = null;
+let cachedNoise = null;
+let cachedBiome = null;
 
 // Seeded PRNG
 function mulberry32(a) {
@@ -1457,6 +1459,8 @@ function enterFPV(planet) {
     planet.mesh.visible = false;
 
     generateTerrain(planet.type.type);
+    cachedNoise = makeNoise(terrainSeed);
+    cachedBiome = BIOMES[planet.type.type] || BIOMES.terrestrial;
 
     fpvSavedFog = scene.fog;
     const b = BIOMES[planet.type.type] || BIOMES.terrestrial;
@@ -1496,15 +1500,13 @@ function updateFPV() {
     if (!fpvMode || !fpvPlanet) return;
     if (!fpvPlanet.alive) { exitFPV(); return; }
 
-    const b = BIOMES[fpvPlanet.type.type] || BIOMES.terrestrial;
     const wp = fpvPlanet.mesh.position;
 
     terrainGroup.position.copy(wp);
     if (fpvSky) fpvSky.position.copy(wp);
 
     const walkX = fpvLon * 15, walkZ = fpvLat * 15;
-    const noise = makeNoise(terrainSeed);
-    const groundY = getHeight(noise, walkX, walkZ, b.hScale);
+    const groundY = getHeight(cachedNoise, walkX, walkZ, cachedBiome.hScale);
 
     camera.position.set(wp.x + walkX, wp.y + groundY + 0.4, wp.z + walkZ);
     camera.up.set(0, 1, 0);
