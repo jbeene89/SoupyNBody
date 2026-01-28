@@ -374,6 +374,14 @@ let nBodyEngine = null;
 
 // Stellar effects (beams, accretion disks, field lines)
 let stellarEffects = [];
+// Panoramic mode
+let panoramicMode = false;
+let panAngle = 0;
+let panElevation = 0.3;
+let panRadius = 80;
+let panSavedCamPos = null;
+let panSavedCamTarget = null;
+let panSavedFov = 60;
 // Free-floating ambient particles
 let ambientParticles = null;
 let ambientCount = 15000;
@@ -1725,6 +1733,14 @@ function setupUI() {
         }
     });
 
+    document.getElementById('btn-panoramic').addEventListener('click', () => {
+        if (panoramicMode) {
+            exitPanoramic();
+        } else {
+            enterPanoramic();
+        }
+    });
+
     document.getElementById('time-scale').addEventListener('input', (e) => {
         CONFIG.timeScale = e.target.value / 100 * 2;
     });
@@ -1799,7 +1815,9 @@ function animate() {
         updateAmbientParticles(dt);
     }
 
-    if (fpvMode) {
+    if (panoramicMode) {
+        updatePanoramic(0.016 * CONFIG.timeScale);
+    } else if (fpvMode) {
         updateFPV();
     } else {
         controls.update();
@@ -1829,6 +1847,106 @@ function animate() {
     if (debrisActive) status += `, ${CONFIG.debrisCount.toLocaleString()} debris`;
     if (coalescencePhase) status += ' [COALESCING]';
     document.getElementById('particle-count').textContent = status;
+}
+
+// ============================================================================
+// Panoramic Mode - cinematic auto-orbit with wide FOV
+// ============================================================================
+
+function enterPanoramic() {
+    if (fpvMode) exitFPV();
+    panoramicMode = true;
+    panSavedCamPos = camera.position.clone();
+    panSavedCamTarget = controls.target.clone();
+    panSavedFov = camera.fov;
+    controls.enabled = false;
+
+    // Start angle from current camera position
+    panAngle = Math.atan2(camera.position.x, camera.position.z);
+    panElevation = 0.3;
+    panRadius = 80;
+
+    // Widen FOV for cinematic panoramic look
+    camera.fov = 100;
+    camera.updateProjectionMatrix();
+
+    document.getElementById('btn-panoramic').textContent = 'Exit Panoramic';
+    document.getElementById('btn-panoramic').style.background = 'rgba(255, 170, 50, 0.4)';
+    document.getElementById('btn-panoramic').style.borderColor = 'rgba(255, 170, 50, 0.7)';
+}
+
+function exitPanoramic() {
+    panoramicMode = false;
+    controls.enabled = true;
+
+    // Restore camera
+    camera.position.copy(panSavedCamPos);
+    controls.target.copy(panSavedCamTarget);
+    camera.fov = panSavedFov;
+    camera.updateProjectionMatrix();
+
+    document.getElementById('btn-panoramic').textContent = 'Panoramic';
+    document.getElementById('btn-panoramic').style.background = '';
+    document.getElementById('btn-panoramic').style.borderColor = '';
+}
+
+function updatePanoramic(dt) {
+    if (!panoramicMode) return;
+
+    // Compute center of mass of all alive bodies
+    let cx = 0, cy = 0, cz = 0, totalMass = 0;
+    for (const p of planets) {
+        if (!p.alive) continue;
+        cx += p.mesh.position.x * p.mass;
+        cy += p.mesh.position.y * p.mass;
+        cz += p.mesh.position.z * p.mass;
+        totalMass += p.mass;
+    }
+    if (totalMass > 0) {
+        cx /= totalMass;
+        cy /= totalMass;
+        cz /= totalMass;
+    }
+
+    // Slow orbit around center of mass
+    panAngle += dt * 0.15;
+
+    // Gentle elevation oscillation (sweeps up and down)
+    panElevation = 0.25 + Math.sin(simTime * 0.08) * 0.35;
+
+    // Slow radius breathing (dolly in/out)
+    const baseRadius = 70;
+    panRadius = baseRadius + Math.sin(simTime * 0.05) * 25;
+
+    // If collision happened, pull in closer temporarily
+    if (collisionOccurred && debrisActive) {
+        panRadius = Math.min(panRadius, 45 + Math.sin(simTime * 0.1) * 10);
+    }
+
+    // Camera position on orbit
+    const camX = cx + Math.sin(panAngle) * panRadius * Math.cos(panElevation);
+    const camY = cy + Math.sin(panElevation) * panRadius * 0.6 + 10;
+    const camZ = cz + Math.cos(panAngle) * panRadius * Math.cos(panElevation);
+
+    // Smooth lerp to target position
+    camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.02);
+
+    // Look at center of mass with slight lead (look slightly ahead of orbit)
+    const lookAhead = 0.3;
+    const lx = cx + Math.sin(panAngle + lookAhead) * 5;
+    const lz = cz + Math.cos(panAngle + lookAhead) * 5;
+    const lookTarget = new THREE.Vector3(lx, cy, lz);
+
+    // Smooth look-at
+    const currentLook = new THREE.Vector3();
+    camera.getWorldDirection(currentLook);
+    const desiredLook = lookTarget.clone().sub(camera.position).normalize();
+    currentLook.lerp(desiredLook, 0.03);
+    camera.lookAt(camera.position.clone().add(currentLook.multiplyScalar(100)));
+
+    // Slight FOV oscillation for breathing effect
+    camera.fov = 95 + Math.sin(simTime * 0.12) * 8;
+    camera.updateProjectionMatrix();
 }
 
 function onResize() {
@@ -2174,6 +2292,7 @@ function destroyTerrain() {
 
 function enterFPV(planet) {
     if (!planet || !planet.alive) return;
+    if (panoramicMode) exitPanoramic();
 
     fpvMode = true;
     fpvPlanet = planet;
