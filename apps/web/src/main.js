@@ -121,6 +121,52 @@ const PLANET_TYPES = [
         bumpScale: 0.35,
         type: 'crystal',
     },
+    // --- Stellar remnants ---
+    {
+        name: 'Neutron Star',
+        radius: 1.2,
+        mass: 1200,
+        colors: [0xccddff, 0xeeeeff, 0x8899cc, 0xffffff, 0xaabbff],
+        emissive: 0x88aaff,
+        emissiveIntensity: 1.5,
+        moons: 0,
+        moonRadius: 0,
+        moonOrbitRadius: 0,
+        moonColor: 0,
+        bumpScale: 0.02,
+        type: 'neutron',
+        isStellar: true,
+    },
+    {
+        name: 'Pulsar',
+        radius: 1.0,
+        mass: 1400,
+        colors: [0x00ccff, 0x44eeff, 0x0066aa, 0x88ffff, 0x003366],
+        emissive: 0x00aaff,
+        emissiveIntensity: 2.0,
+        moons: 0,
+        moonRadius: 0,
+        moonOrbitRadius: 0,
+        moonColor: 0,
+        bumpScale: 0.01,
+        type: 'pulsar',
+        isStellar: true,
+    },
+    {
+        name: 'Magnetar',
+        radius: 1.3,
+        mass: 1600,
+        colors: [0xff00ff, 0xff44aa, 0xaa00cc, 0xff88dd, 0x6600aa],
+        emissive: 0xff00cc,
+        emissiveIntensity: 2.5,
+        moons: 0,
+        moonRadius: 0,
+        moonOrbitRadius: 0,
+        moonColor: 0,
+        bumpScale: 0.01,
+        type: 'magnetar',
+        isStellar: true,
+    },
 ];
 
 // ============================================================================
@@ -326,6 +372,20 @@ let fpvPointerLocked = false;
 // Physics engine (university-level N-body computation)
 let nBodyEngine = null;
 
+// Stellar effects (beams, accretion disks, field lines)
+let stellarEffects = [];
+// Panoramic mode
+let panoramicMode = false;
+let panAngle = 0;
+let panElevation = 0.3;
+let panRadius = 80;
+let panSavedCamPos = null;
+let panSavedCamTarget = null;
+let panSavedFov = 60;
+// Free-floating ambient particles
+let ambientParticles = null;
+let ambientCount = 15000;
+
 function init() {
     // Scene
     scene = new THREE.Scene();
@@ -391,6 +451,9 @@ function init() {
     // Pre-allocate debris arrays
     allocateDebris();
 
+    // Ambient particles (interstellar dust/gas)
+    createAmbientParticles();
+
     // UI
     setupUI();
 
@@ -446,16 +509,24 @@ function createBackgroundStars() {
 }
 
 function createPlanets() {
-    // Pick 3-4 random planet types
-    const shuffled = [...PLANET_TYPES].sort(() => Math.random() - 0.5);
-    const selected = shuffled.slice(0, 4);
+    // Pick a mix: 3-4 planets + 1-2 stellar objects
+    const planetTypes = PLANET_TYPES.filter(p => !p.isStellar);
+    const stellarTypes = PLANET_TYPES.filter(p => p.isStellar);
+    const shuffledPlanets = [...planetTypes].sort(() => Math.random() - 0.5);
+    const shuffledStellar = [...stellarTypes].sort(() => Math.random() - 0.5);
+    const selected = [
+        ...shuffledPlanets.slice(0, 3 + Math.floor(Math.random() * 2)),
+        ...shuffledStellar.slice(0, 1 + Math.floor(Math.random() * 2)),
+    ];
 
-    // Arrange them on a collision course
+    // Arrange them on a collision course (up to 6 bodies)
     const arrangements = [
         { pos: new THREE.Vector3(-35, 5, -10), vel: new THREE.Vector3(4, -0.5, 1) },
         { pos: new THREE.Vector3(35, -5, 10), vel: new THREE.Vector3(-4, 0.5, -1) },
         { pos: new THREE.Vector3(0, 30, -20), vel: new THREE.Vector3(0.5, -3.5, 2) },
         { pos: new THREE.Vector3(5, -30, 15), vel: new THREE.Vector3(-0.5, 3, -1.5) },
+        { pos: new THREE.Vector3(-25, -20, 25), vel: new THREE.Vector3(3, 2, -2) },
+        { pos: new THREE.Vector3(20, 25, -25), vel: new THREE.Vector3(-2, -2.5, 1.5) },
     ];
 
     const bumpMap = generateBumpMap();
@@ -502,6 +573,11 @@ function createPlanets() {
             mesh.add(ring);
         }
 
+        // Stellar object visual effects
+        if (pType.isStellar) {
+            createStellarEffects(mesh, pType);
+        }
+
         const planet = {
             mesh,
             vel: arrangements[i].vel.clone(),
@@ -509,7 +585,8 @@ function createPlanets() {
             radius: pType.radius,
             type: pType,
             alive: true,
-            angularVel: (Math.random() - 0.5) * 2,
+            isStellar: !!pType.isStellar,
+            angularVel: pType.isStellar ? (5 + Math.random() * 15) : (Math.random() - 0.5) * 2,
             rotationAxis: new THREE.Vector3(
                 Math.random() - 0.5,
                 1,
@@ -562,6 +639,320 @@ function createPlanets() {
             });
         }
     });
+}
+
+// ============================================================================
+// Stellar Visual Effects
+// ============================================================================
+
+function createStellarEffects(mesh, pType) {
+    const r = pType.radius;
+    const effect = { mesh, type: pType.type, children: [] };
+
+    // Core glow sphere (intense inner glow)
+    const glowGeo = new THREE.SphereGeometry(r * 1.6, 24, 16);
+    const glowMat = new THREE.MeshBasicMaterial({
+        color: pType.emissive,
+        transparent: true,
+        opacity: 0.25,
+        side: THREE.BackSide,
+    });
+    const glow = new THREE.Mesh(glowGeo, glowMat);
+    mesh.add(glow);
+    effect.coreGlow = glow;
+
+    // Outer halo
+    const haloGeo = new THREE.SphereGeometry(r * 3, 16, 12);
+    const haloMat = new THREE.MeshBasicMaterial({
+        color: pType.emissive,
+        transparent: true,
+        opacity: 0.07,
+        side: THREE.BackSide,
+    });
+    const halo = new THREE.Mesh(haloGeo, haloMat);
+    mesh.add(halo);
+    effect.halo = halo;
+
+    // Point light (stellar objects are luminous)
+    const light = new THREE.PointLight(pType.emissive, 8, r * 40);
+    mesh.add(light);
+    effect.light = light;
+
+    if (pType.type === 'pulsar') {
+        // Twin jet beams along rotation axis
+        const beamLen = r * 25;
+        const beamGeo = new THREE.CylinderGeometry(r * 0.15, r * 0.6, beamLen, 8, 1, true);
+        const beamMat = new THREE.MeshBasicMaterial({
+            color: 0x00ccff,
+            transparent: true,
+            opacity: 0.5,
+            side: THREE.DoubleSide,
+        });
+        const beam1 = new THREE.Mesh(beamGeo, beamMat);
+        beam1.position.y = beamLen / 2;
+        mesh.add(beam1);
+        const beam2 = new THREE.Mesh(beamGeo, beamMat.clone());
+        beam2.position.y = -beamLen / 2;
+        beam2.rotation.x = Math.PI;
+        mesh.add(beam2);
+        effect.beams = [beam1, beam2];
+
+        // Cone glow at beam tips
+        const coneGeo = new THREE.ConeGeometry(r * 1.5, r * 4, 12, 1, true);
+        const coneMat = new THREE.MeshBasicMaterial({
+            color: 0x44eeff,
+            transparent: true,
+            opacity: 0.2,
+        });
+        const cone1 = new THREE.Mesh(coneGeo, coneMat);
+        cone1.position.y = beamLen + r * 2;
+        mesh.add(cone1);
+        const cone2 = new THREE.Mesh(coneGeo, coneMat.clone());
+        cone2.position.y = -(beamLen + r * 2);
+        cone2.rotation.x = Math.PI;
+        mesh.add(cone2);
+        effect.cones = [cone1, cone2];
+    }
+
+    if (pType.type === 'magnetar') {
+        // Magnetic field lines (torus loops at different angles)
+        for (let fi = 0; fi < 4; fi++) {
+            const torusGeo = new THREE.TorusGeometry(r * (3 + fi * 1.5), r * 0.08, 8, 48);
+            const torusMat = new THREE.MeshBasicMaterial({
+                color: 0xff44cc,
+                transparent: true,
+                opacity: 0.2 - fi * 0.03,
+            });
+            const torus = new THREE.Mesh(torusGeo, torusMat);
+            torus.rotation.x = Math.PI / 2 + (fi * 0.3 - 0.45);
+            torus.rotation.z = fi * 0.8;
+            mesh.add(torus);
+            effect.children.push(torus);
+        }
+
+        // Energy bursts (small sprite-like spheres orbiting)
+        effect.bursts = [];
+        for (let bi = 0; bi < 12; bi++) {
+            const bGeo = new THREE.SphereGeometry(r * 0.2, 6, 6);
+            const bMat = new THREE.MeshBasicMaterial({
+                color: 0xff88ff,
+                transparent: true,
+                opacity: 0.6,
+            });
+            const burst = new THREE.Mesh(bGeo, bMat);
+            mesh.add(burst);
+            effect.bursts.push({
+                mesh: burst,
+                angle: (bi / 12) * Math.PI * 2,
+                radius: r * (2.5 + Math.random() * 3),
+                speed: 1.5 + Math.random() * 2,
+                tilt: (Math.random() - 0.5) * Math.PI * 0.8,
+                yOff: (Math.random() - 0.5) * r * 3,
+            });
+        }
+    }
+
+    if (pType.type === 'neutron') {
+        // Accretion disk (flat ring of particles)
+        const diskCount = 3000;
+        const diskGeo = new THREE.BufferGeometry();
+        const diskPos = new Float32Array(diskCount * 3);
+        const diskCol = new Float32Array(diskCount * 3);
+        const diskSizes = new Float32Array(diskCount);
+        for (let di = 0; di < diskCount; di++) {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = r * 2 + Math.random() * r * 6;
+            const spread = (Math.random() - 0.5) * r * 0.4;
+            diskPos[di * 3] = Math.cos(angle) * dist;
+            diskPos[di * 3 + 1] = spread;
+            diskPos[di * 3 + 2] = Math.sin(angle) * dist;
+            // Hot inner (white-blue) → cool outer (orange-red)
+            const t = (dist - r * 2) / (r * 6);
+            diskCol[di * 3] = 0.5 + (1 - t) * 0.5;
+            diskCol[di * 3 + 1] = 0.6 + (1 - t) * 0.4 - t * 0.3;
+            diskCol[di * 3 + 2] = 0.8 + (1 - t) * 0.2 - t * 0.6;
+            diskSizes[di] = 0.2 + Math.random() * 0.4;
+        }
+        diskGeo.setAttribute('position', new THREE.BufferAttribute(diskPos, 3));
+        diskGeo.setAttribute('color', new THREE.BufferAttribute(diskCol, 3));
+        diskGeo.setAttribute('size', new THREE.BufferAttribute(diskSizes, 1));
+        const diskMat = new THREE.PointsMaterial({
+            vertexColors: true,
+            size: 0.3,
+            sizeAttenuation: true,
+            transparent: true,
+            opacity: 0.7,
+        });
+        const disk = new THREE.Points(diskGeo, diskMat);
+        mesh.add(disk);
+        effect.disk = disk;
+        effect.diskCount = diskCount;
+    }
+
+    stellarEffects.push(effect);
+}
+
+function updateStellarEffects(dt) {
+    for (const fx of stellarEffects) {
+        if (!fx.mesh.parent) continue; // removed from scene
+
+        // Pulsing core glow
+        if (fx.coreGlow) {
+            const pulse = 0.2 + Math.sin(simTime * (fx.type === 'pulsar' ? 20 : 5)) * 0.1;
+            fx.coreGlow.material.opacity = pulse;
+        }
+
+        // Halo flicker
+        if (fx.halo) {
+            fx.halo.material.opacity = 0.05 + Math.sin(simTime * 3.3 + 1) * 0.03;
+        }
+
+        // Light pulsing
+        if (fx.light) {
+            fx.light.intensity = 6 + Math.sin(simTime * (fx.type === 'pulsar' ? 25 : 4)) * 3;
+        }
+
+        // Pulsar beam opacity oscillation (lighthouse effect done by mesh spin)
+        if (fx.beams) {
+            const beamPulse = 0.3 + Math.abs(Math.sin(simTime * 15)) * 0.4;
+            fx.beams[0].material.opacity = beamPulse;
+            fx.beams[1].material.opacity = beamPulse;
+        }
+        if (fx.cones) {
+            const conePulse = 0.1 + Math.abs(Math.sin(simTime * 15)) * 0.2;
+            fx.cones[0].material.opacity = conePulse;
+            fx.cones[1].material.opacity = conePulse;
+        }
+
+        // Magnetar bursts orbit
+        if (fx.bursts) {
+            for (const b of fx.bursts) {
+                b.angle += b.speed * dt;
+                b.mesh.position.set(
+                    Math.cos(b.angle) * b.radius,
+                    b.yOff + Math.sin(b.angle * 0.7) * b.radius * 0.3,
+                    Math.sin(b.angle) * b.radius
+                );
+                b.mesh.material.opacity = 0.3 + Math.sin(b.angle * 3) * 0.3;
+            }
+        }
+
+        // Magnetar field lines wobble
+        for (let ci = 0; ci < fx.children.length; ci++) {
+            const child = fx.children[ci];
+            child.rotation.y += dt * (0.3 + ci * 0.15);
+        }
+
+        // Neutron star accretion disk rotation
+        if (fx.disk) {
+            fx.disk.rotation.y += dt * 2.5;
+        }
+    }
+}
+
+// ============================================================================
+// Ambient free-floating particles
+// ============================================================================
+
+function createAmbientParticles() {
+    const count = ambientCount;
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(count * 3);
+    const col = new Float32Array(count * 3);
+    const vel = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        // Spread across the simulation volume
+        pos[i3] = (Math.random() - 0.5) * 200;
+        pos[i3 + 1] = (Math.random() - 0.5) * 200;
+        pos[i3 + 2] = (Math.random() - 0.5) * 200;
+
+        // Slow random drift
+        vel[i3] = (Math.random() - 0.5) * 0.5;
+        vel[i3 + 1] = (Math.random() - 0.5) * 0.5;
+        vel[i3 + 2] = (Math.random() - 0.5) * 0.5;
+
+        // Warm interstellar dust colors
+        const t = Math.random();
+        if (t < 0.3) {
+            // Blue-white (hot gas)
+            col[i3] = 0.6 + Math.random() * 0.4;
+            col[i3 + 1] = 0.7 + Math.random() * 0.3;
+            col[i3 + 2] = 0.9 + Math.random() * 0.1;
+        } else if (t < 0.6) {
+            // Orange-red (warm dust)
+            col[i3] = 0.8 + Math.random() * 0.2;
+            col[i3 + 1] = 0.3 + Math.random() * 0.3;
+            col[i3 + 2] = 0.1 + Math.random() * 0.15;
+        } else {
+            // Dim neutral (cold dust)
+            const v = 0.3 + Math.random() * 0.3;
+            col[i3] = v;
+            col[i3 + 1] = v * 0.9;
+            col[i3 + 2] = v * 1.1;
+        }
+
+        sizes[i] = 0.1 + Math.random() * 0.5;
+    }
+
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+    const mat = new THREE.PointsMaterial({
+        vertexColors: true,
+        size: 0.3,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.5,
+    });
+
+    ambientParticles = new THREE.Points(geo, mat);
+    ambientParticles._vel = vel;
+    scene.add(ambientParticles);
+}
+
+function updateAmbientParticles(dt) {
+    if (!ambientParticles) return;
+    const pos = ambientParticles.geometry.attributes.position.array;
+    const vel = ambientParticles._vel;
+    const activePlanets = planets.filter(p => p.alive);
+
+    for (let i = 0; i < ambientCount; i++) {
+        const i3 = i * 3;
+
+        // Gravity from all alive planets/stellar objects
+        for (const p of activePlanets) {
+            const dx = p.mesh.position.x - pos[i3];
+            const dy = p.mesh.position.y - pos[i3 + 1];
+            const dz = p.mesh.position.z - pos[i3 + 2];
+            const dist2 = dx * dx + dy * dy + dz * dz + 4;
+            const dist = Math.sqrt(dist2);
+            // Stellar objects have stronger gravity pull on particles
+            const strength = CONFIG.G * p.mass * 0.0003 / dist2;
+            vel[i3] += dx / dist * strength * dt;
+            vel[i3 + 1] += dy / dist * strength * dt;
+            vel[i3 + 2] += dz / dist * strength * dt;
+        }
+
+        // Damping to keep things stable
+        vel[i3] *= 0.9995;
+        vel[i3 + 1] *= 0.9995;
+        vel[i3 + 2] *= 0.9995;
+
+        pos[i3] += vel[i3] * dt;
+        pos[i3 + 1] += vel[i3 + 1] * dt;
+        pos[i3 + 2] += vel[i3 + 2] * dt;
+
+        // Wrap particles that drift too far
+        for (let k = 0; k < 3; k++) {
+            if (pos[i3 + k] > 120) pos[i3 + k] = -120;
+            if (pos[i3 + k] < -120) pos[i3 + k] = 120;
+        }
+    }
+
+    ambientParticles.geometry.attributes.position.needsUpdate = true;
 }
 
 function allocateDebris() {
@@ -1329,8 +1720,8 @@ function setupUI() {
             exitFPV();
             return;
         }
-        // Enter picking mode - user clicks a planet to land on
-        const alive = planets.filter(p => p.alive);
+        // Enter picking mode - user clicks a planet to land on (no stellar objects)
+        const alive = planets.filter(p => p.alive && !p.isStellar);
         if (alive.length === 0) return;
         // Auto-land on first alive planet, or enable picking
         if (alive.length === 1) {
@@ -1339,6 +1730,14 @@ function setupUI() {
             fpvPickingMode = true;
             document.getElementById('fpv-info').style.display = 'flex';
             document.getElementById('fpv-info').querySelector('span').textContent = 'Click a planet to land on it';
+        }
+    });
+
+    document.getElementById('btn-panoramic').addEventListener('click', () => {
+        if (panoramicMode) {
+            exitPanoramic();
+        } else {
+            enterPanoramic();
         }
     });
 
@@ -1365,6 +1764,12 @@ function resetSimulation() {
     if (finalPlanet && finalPlanet.parent) scene.remove(finalPlanet);
     shockwaves.forEach(sw => scene.remove(sw.mesh));
 
+    // Clean up stellar effects
+    stellarEffects = [];
+    // Clean up ambient particles
+    if (ambientParticles && ambientParticles.parent) scene.remove(ambientParticles);
+    ambientParticles = null;
+
     planets = [];
     moons = [];
     shockwaves = [];
@@ -1390,7 +1795,8 @@ function resetSimulation() {
     simTime = 0;
 
     createPlanets();
-    document.getElementById('particle-count').textContent = planets.length + ' planets';
+    createAmbientParticles();
+    document.getElementById('particle-count').textContent = planets.length + ' bodies';
 }
 
 // ============================================================================
@@ -1405,9 +1811,13 @@ function animate() {
         simTime += dt;
         updatePhysics(dt);
         updateShockwaves(dt);
+        updateStellarEffects(dt);
+        updateAmbientParticles(dt);
     }
 
-    if (fpvMode) {
+    if (panoramicMode) {
+        updatePanoramic(0.016 * CONFIG.timeScale);
+    } else if (fpvMode) {
         updateFPV();
     } else {
         controls.update();
@@ -1427,12 +1837,116 @@ function animate() {
     }
 
     // Update particle count display
-    const alivePlanets = planets.filter(p => p.alive).length;
+    const aliveBodies = planets.filter(p => p.alive);
+    const alivePlanetsCount = aliveBodies.filter(p => !p.isStellar).length;
+    const aliveStellarCount = aliveBodies.filter(p => p.isStellar).length;
     const aliveMoons = moons.filter(m => m.alive).length;
-    let status = `${alivePlanets} planets, ${aliveMoons} moons`;
+    let status = `${alivePlanetsCount} planets`;
+    if (aliveStellarCount > 0) status += `, ${aliveStellarCount} stellar`;
+    status += `, ${aliveMoons} moons, ${ambientCount.toLocaleString()} particles`;
     if (debrisActive) status += `, ${CONFIG.debrisCount.toLocaleString()} debris`;
     if (coalescencePhase) status += ' [COALESCING]';
     document.getElementById('particle-count').textContent = status;
+}
+
+// ============================================================================
+// Panoramic Mode - cinematic auto-orbit with wide FOV
+// ============================================================================
+
+function enterPanoramic() {
+    if (fpvMode) exitFPV();
+    panoramicMode = true;
+    panSavedCamPos = camera.position.clone();
+    panSavedCamTarget = controls.target.clone();
+    panSavedFov = camera.fov;
+    controls.enabled = false;
+
+    // Start angle from current camera position
+    panAngle = Math.atan2(camera.position.x, camera.position.z);
+    panElevation = 0.3;
+    panRadius = 80;
+
+    // Widen FOV for cinematic panoramic look
+    camera.fov = 100;
+    camera.updateProjectionMatrix();
+
+    document.getElementById('btn-panoramic').textContent = 'Exit Panoramic';
+    document.getElementById('btn-panoramic').style.background = 'rgba(255, 170, 50, 0.4)';
+    document.getElementById('btn-panoramic').style.borderColor = 'rgba(255, 170, 50, 0.7)';
+}
+
+function exitPanoramic() {
+    panoramicMode = false;
+    controls.enabled = true;
+
+    // Restore camera
+    camera.position.copy(panSavedCamPos);
+    controls.target.copy(panSavedCamTarget);
+    camera.fov = panSavedFov;
+    camera.updateProjectionMatrix();
+
+    document.getElementById('btn-panoramic').textContent = 'Panoramic';
+    document.getElementById('btn-panoramic').style.background = '';
+    document.getElementById('btn-panoramic').style.borderColor = '';
+}
+
+function updatePanoramic(dt) {
+    if (!panoramicMode) return;
+
+    // Compute center of mass of all alive bodies
+    let cx = 0, cy = 0, cz = 0, totalMass = 0;
+    for (const p of planets) {
+        if (!p.alive) continue;
+        cx += p.mesh.position.x * p.mass;
+        cy += p.mesh.position.y * p.mass;
+        cz += p.mesh.position.z * p.mass;
+        totalMass += p.mass;
+    }
+    if (totalMass > 0) {
+        cx /= totalMass;
+        cy /= totalMass;
+        cz /= totalMass;
+    }
+
+    // Slow orbit around center of mass
+    panAngle += dt * 0.15;
+
+    // Gentle elevation oscillation (sweeps up and down)
+    panElevation = 0.25 + Math.sin(simTime * 0.08) * 0.35;
+
+    // Slow radius breathing (dolly in/out)
+    const baseRadius = 70;
+    panRadius = baseRadius + Math.sin(simTime * 0.05) * 25;
+
+    // If collision happened, pull in closer temporarily
+    if (collisionOccurred && debrisActive) {
+        panRadius = Math.min(panRadius, 45 + Math.sin(simTime * 0.1) * 10);
+    }
+
+    // Camera position on orbit
+    const camX = cx + Math.sin(panAngle) * panRadius * Math.cos(panElevation);
+    const camY = cy + Math.sin(panElevation) * panRadius * 0.6 + 10;
+    const camZ = cz + Math.cos(panAngle) * panRadius * Math.cos(panElevation);
+
+    // Smooth lerp to target position
+    camera.position.lerp(new THREE.Vector3(camX, camY, camZ), 0.02);
+
+    // Look at center of mass with slight lead (look slightly ahead of orbit)
+    const lookAhead = 0.3;
+    const lx = cx + Math.sin(panAngle + lookAhead) * 5;
+    const lz = cz + Math.cos(panAngle + lookAhead) * 5;
+    const lookTarget = new THREE.Vector3(lx, cy, lz);
+
+    // Smooth look-at
+    const currentLook = new THREE.Vector3();
+    camera.getWorldDirection(currentLook);
+    const desiredLook = lookTarget.clone().sub(camera.position).normalize();
+    currentLook.lerp(desiredLook, 0.03);
+    camera.lookAt(camera.position.clone().add(currentLook.multiplyScalar(100)));
+
+    // Slight FOV oscillation for breathing effect
+    camera.fov = 95 + Math.sin(simTime * 0.12) * 8;
+    camera.updateProjectionMatrix();
 }
 
 function onResize() {
@@ -1778,6 +2292,7 @@ function destroyTerrain() {
 
 function enterFPV(planet) {
     if (!planet || !planet.alive) return;
+    if (panoramicMode) exitPanoramic();
 
     fpvMode = true;
     fpvPlanet = planet;
